@@ -1,41 +1,55 @@
-//
-// Created by maks on 7/8/26.
-//
-
 #ifndef BANKSCONNECTAPP_TRANS_H
 #define BANKSCONNECTAPP_TRANS_H
+
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace my {
 
-    enum class tag {
-        must,
-        opt,
-        waste,
-    };
+enum class month {
+    january,
+    february,
+    march,
+    april,
+    may,
+    june,
+    july,
+    august,
+    september,
+    october,
+    november,
+    december
+};
 
-    enum class currency {
-        USD,
-        EUR,
-        PLN,
-    };
+enum class tag {
+    must,
+    opt,
+    waste,
+};
 
-    enum class type {
-        income,
-        expense,
-        inside,
-    };
+enum class currency {
+    USD,
+    EUR,
+    PLN,
+};
 
-    enum class category {
-        food,
-        transport,
-        entertainment,
-        utilities,
-        alko,
-        wyjazdy,
-        other
-    };
+enum class type {
+    income,
+    expense,
+    inside,
+};
+
+enum class category {
+    food,
+    transport,
+    entertainment,
+    utilities,
+    alko,
+    wyjazdy,
+    other
+};
+
 }
 
 struct trans {
@@ -54,9 +68,9 @@ struct trans {
 
 struct nextMonth {
     my::month month;
-    std::hash_map<my::category, int> categorySumsCel;
-    std::hash_map<my::category, int> categorySumsreal;
-    std::hash_map<my::category, std::vector<trans>> categorySumsSub;
+    std::unordered_map<my::category, int> categorySumsCel;
+    std::unordered_map<my::category, int> categorySumsreal;
+    std::unordered_map<my::category, std::vector<trans>> categorySumsSub;
 };
 
 struct toDoComming {

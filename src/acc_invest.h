@@ -1,27 +1,27 @@
-//
-// Created by maks on 7/8/26.
-//
-
 #ifndef BANKSCONNECTAPP_ACC_INVEST_H
 #define BANKSCONNECTAPP_ACC_INVEST_H
 
+#include <string>
+#include <vector>
 
-struct investAssest {
+#include "acc.h"
+
+struct investAsset {
     std::string name;
     int amount_start;
-    int amount_end; // before getting out is 0
+    int amount_end;
     std::string date_start;
     std::string date_end;
 };
 
-class accInvest : acc {
-    std::vector<investAssest> investments;
+class accInvest : public acc {
+    std::vector<investAsset> investments;
+
 public:
     accInvest(std::string name, int balance);
-    void addInvestment(const investAssest& investment);
+    void addInvestment(const investAsset& investment);
     void deleteInvestment(const std::string& investmentName);
-    const std::vector<investAssest>& getInvestments() const;
+    const std::vector<investAsset>& getInvestments() const;
 };
-
 
 #endif //BANKSCONNECTAPP_ACC_INVEST_H

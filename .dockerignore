@@ -1,0 +1,10 @@
+.git
+.idea
+cmake-build-debug
+build
+*.o
+*.obj
+*.exe
+*.out
+*.log
+*.pem
