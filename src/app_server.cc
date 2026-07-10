@@ -3,11 +3,17 @@
 #include "json_mapper.h"
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <sys/socket.h>
@@ -22,6 +28,13 @@ std::string trim(const std::string& value) {
     }
     const std::size_t end = value.find_last_not_of(" \t\r\n");
     return value.substr(begin, end - begin + 1);
+}
+
+std::string lowerCopy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
 }
 }
 
@@ -39,13 +52,16 @@ void AppServer::run() {
     const char* portEnv = std::getenv("PORT");
     const int port = portEnv != nullptr && *portEnv != '\0' ? std::stoi(portEnv) : 8080;
     if (config_.redirectUri.empty()) {
-        throw std::runtime_error("ENABLEBANKING_REDIRECT_URI is required, or set RAILWAY_PUBLIC_DOMAIN/RAILWAY_STATIC_URL");
+        throw std::runtime_error("ENABLEBANKING_REDIRECT_URI or PUBLIC_BASE_URL is required");
+    }
+    if (config_.apiToken.empty()) {
+        std::cout << "Warning: ENABLEBANKING_API_TOKEN is not set; /api/* endpoints will be disabled." << std::endl;
     }
     if (config_.accessToken.empty() && (config_.privateKeyPath.empty() || config_.appCode.empty())) {
         throw std::runtime_error("Set ENABLEBANKING_ACCESS_TOKEN or ENABLEBANKING_PRIVATE_KEY_PATH and ENABLEBANKING_APP_CODE");
     }
 
-    std::cout << "Starting Railway service on port " << port << std::endl;
+    std::cout << "Starting service on port " << port << std::endl;
     std::cout << "Callback URL: " << config_.redirectUri << std::endl;
 
     running_ = true;
@@ -135,7 +151,12 @@ void AppServer::serve(int port) {
 
         const std::string rawRequest = readRequest(clientFd);
         const HttpRequest request = parseRequest(rawRequest);
-        const HttpResponse response = handleRequest(request);
+        HttpResponse response;
+        if (config_.enforceHttps && !requestIsSecure(request) && !config_.allowInsecureHttp) {
+            response = redirectToHttps(request);
+        } else {
+            response = handleRequest(request);
+        }
         const std::string rawResponse = buildResponse(response);
         ::send(clientFd, rawResponse.data(), rawResponse.size(), 0);
         ::close(clientFd);
@@ -276,25 +297,208 @@ std::string AppServer::htmlEscape(const std::string& value) {
     return escaped;
 }
 
-bool AppServer::webhookSecretValid(const HttpRequest& request) const {
-    if (config_.webhookSecret.empty()) {
+bool AppServer::constantTimeEquals(const std::string& left, const std::string& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    unsigned char diff = 0;
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        diff |= static_cast<unsigned char>(left[i] ^ right[i]);
+    }
+    return diff == 0;
+}
+
+std::string AppServer::jsonEscape(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for (const char ch : value) {
+        switch (ch) {
+            case '\\': escaped += "\\\\"; break;
+            case '"': escaped += "\\\""; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default: escaped.push_back(ch); break;
+        }
+    }
+    return escaped;
+}
+
+std::string AppServer::jsonString(const std::string& value) {
+    return std::string("\"") + jsonEscape(value) + "\"";
+}
+
+std::string AppServer::enumToString(my::currency currency) {
+    switch (currency) {
+        case my::currency::USD: return "USD";
+        case my::currency::EUR: return "EUR";
+        case my::currency::PLN: return "PLN";
+    }
+    return "EUR";
+}
+
+std::string AppServer::enumToString(my::type type) {
+    switch (type) {
+        case my::type::income: return "income";
+        case my::type::expense: return "expense";
+        case my::type::inside: return "inside";
+    }
+    return "expense";
+}
+
+std::string AppServer::enumToString(my::tag tag) {
+    switch (tag) {
+        case my::tag::must: return "must";
+        case my::tag::opt: return "opt";
+        case my::tag::waste: return "waste";
+    }
+    return "opt";
+}
+
+bool AppServer::requestIsSecure(const HttpRequest& request) const {
+    if (config_.allowInsecureHttp) {
         return true;
     }
-    const std::string headerName = config_.webhookSecretHeader.empty() ? "X-Webhook-Secret" : config_.webhookSecretHeader;
-    const auto it = request.headers.find(headerName);
-    return it != request.headers.end() && it->second == config_.webhookSecret;
+    const auto it = request.headers.find("X-Forwarded-Proto");
+    if (it != request.headers.end()) {
+        const std::string proto = lowerCopy(it->second);
+        if (proto.find("https") != std::string::npos) {
+            return true;
+        }
+    }
+    const auto forwarded = request.headers.find("Forwarded");
+    if (forwarded != request.headers.end()) {
+        const std::string forwardedValue = lowerCopy(forwarded->second);
+        if (forwardedValue.find("proto=https") != std::string::npos) {
+            return true;
+        }
+    }
+    const auto ssl = request.headers.find("X-Forwarded-Ssl");
+    if (ssl != request.headers.end() && lowerCopy(ssl->second) == "on") {
+        return true;
+    }
+    return false;
+}
+
+std::string AppServer::configuredPublicBaseUrl() const {
+    const std::string& uri = config_.redirectUri;
+    const std::size_t schemePos = uri.find("://");
+    if (schemePos == std::string::npos) {
+        return std::string();
+    }
+    const std::size_t pathPos = uri.find('/', schemePos + 3);
+    if (pathPos == std::string::npos) {
+        return uri;
+    }
+    return uri.substr(0, pathPos);
+}
+
+std::string AppServer::buildHttpsUrl(const HttpRequest& request) const {
+    std::string host;
+    const auto forwardedHost = request.headers.find("X-Forwarded-Host");
+    if (forwardedHost != request.headers.end() && !forwardedHost->second.empty()) {
+        host = forwardedHost->second;
+    } else {
+        const auto hostHeader = request.headers.find("Host");
+        if (hostHeader != request.headers.end() && !hostHeader->second.empty()) {
+            host = hostHeader->second;
+        }
+    }
+    if (host.empty()) {
+        const std::string base = configuredPublicBaseUrl();
+        if (!base.empty()) {
+            host = base.substr(base.find("://") + 3);
+        }
+    }
+    if (host.empty()) {
+        return config_.redirectUri;
+    }
+
+    std::ostringstream out;
+    out << "https://" << host << request.target;
+    return out.str();
+}
+
+std::string AppServer::generateStateToken() const {
+    std::random_device device;
+    std::ostringstream out;
+    out << std::hex;
+    for (int i = 0; i < 16; ++i) {
+        const unsigned int value = device();
+        out << std::setw(2) << std::setfill('0') << (value & 0xFFu);
+    }
+    out << std::dec;
+    return out.str();
+}
+
+bool AppServer::apiAuthorized(const HttpRequest& request) const {
+    if (config_.apiToken.empty()) {
+        return false;
+    }
+    const auto auth = request.headers.find("Authorization");
+    if (auth == request.headers.end()) {
+        return false;
+    }
+    const std::string prefix = "Bearer ";
+    if (auth->second.rfind(prefix, 0) != 0) {
+        return false;
+    }
+    const std::string token = auth->second.substr(prefix.size());
+    return constantTimeEquals(token, config_.apiToken);
+}
+
+AppServer::HttpResponse AppServer::redirectToHttps(const HttpRequest& request) const {
+    HttpResponse response;
+    response.status = 308;
+    response.contentType = "text/plain; charset=utf-8";
+    response.body = "redirecting to https";
+    response.headers.push_back({"Location", buildHttpsUrl(request)});
+    return response;
+}
+
+AppServer::HttpResponse AppServer::unauthorized(const std::string& message) const {
+    return {401, "text/plain; charset=utf-8", message, {{"WWW-Authenticate", "Bearer"}}};
+}
+
+AppServer::HttpResponse AppServer::jsonResponse(int status, const std::string& body) const {
+    return {status, "application/json; charset=utf-8", body, {}};
 }
 
 AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     const auto query = parseQuery(request.query);
+
     if (request.method == "GET" && request.path == "/health") {
         return {200, "text/plain; charset=utf-8", "ok", {}};
     }
     if (request.method == "GET" && request.path == "/auth/url") {
-        return {200, "text/plain; charset=utf-8", client_.authorizationUrl("railway-state", "accounts transactions balances"), {}};
+        try {
+            const std::string state = generateStateToken();
+            {
+                std::lock_guard<std::mutex> lock(stateMutex_);
+                expectedAuthState_ = state;
+            }
+            return {200, "text/plain; charset=utf-8", client_.authorizationUrl(state, "accounts transactions balances"), {}};
+        } catch (const std::exception& error) {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            lastError_ = error.what();
+            return {500, "text/plain; charset=utf-8", error.what(), {}};
+        }
     }
     if (request.method == "GET" && request.path == "/start-auth") {
-        return {302, "text/plain; charset=utf-8", "redirecting", {{"Location", client_.authorizationUrl("railway-state", "accounts transactions balances")}}};
+        try {
+            const std::string state = generateStateToken();
+            {
+                std::lock_guard<std::mutex> lock(stateMutex_);
+                expectedAuthState_ = state;
+            }
+            return {302, "text/plain; charset=utf-8", "redirecting", {{"Location", client_.authorizationUrl(state, "accounts transactions balances")}}};
+        } catch (const std::exception& error) {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            lastError_ = error.what();
+            return {500, "text/plain; charset=utf-8", error.what(), {}};
+        }
     }
     if (request.method == "GET" && request.path == "/oauth/callback") {
         if (query.count("error") != 0) {
@@ -303,16 +507,25 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             return {400, "text/plain; charset=utf-8", "OAuth error: " + query.at("error"), {}};
         }
         const std::string code = query.count("code") != 0 ? query.at("code") : std::string();
+        const std::string state = query.count("state") != 0 ? query.at("state") : std::string();
         {
             std::lock_guard<std::mutex> lock(stateMutex_);
+            if (expectedAuthState_.empty() || !constantTimeEquals(expectedAuthState_, state)) {
+                lastError_ = "oauth state mismatch";
+                return {400, "text/plain; charset=utf-8", "Invalid OAuth state", {}};
+            }
             lastAuthCode_ = code;
             lastError_.clear();
+            expectedAuthState_.clear();
         }
         return {200, "text/plain; charset=utf-8", "Authorization received. You can close this tab.", {}};
     }
     if (request.method == "POST" && request.path == "/webhook") {
         if (!webhookSecretValid(request)) {
             return {401, "text/plain; charset=utf-8", "invalid webhook secret", {}};
+        }
+        if (!request.headers.count("Content-Type") || lowerCopy(request.headers.at("Content-Type")).find("application/json") == std::string::npos) {
+            return {415, "text/plain; charset=utf-8", "webhook requires application/json", {}};
         }
         {
             std::lock_guard<std::mutex> lock(stateMutex_);
@@ -327,13 +540,16 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
         return {200, "text/plain; charset=utf-8", "ok", {}};
     }
     if (request.method == "GET" && request.path == "/sync") {
+        if (!apiAuthorized(request)) {
+            return unauthorized(config_.apiToken.empty() ? "API token not configured" : "Unauthorized");
+        }
         try {
             syncOnce("manual");
-            return {200, "text/plain; charset=utf-8", renderStatus(), {}};
+            return jsonResponse(200, renderStatus());
         } catch (const std::exception& error) {
             std::lock_guard<std::mutex> lock(stateMutex_);
             lastError_ = error.what();
-            return {500, "text/plain; charset=utf-8", error.what(), {}};
+            return jsonResponse(500, std::string("{\"error\":") + jsonString(error.what()) + "}");
         }
     }
     if (request.method == "GET" && request.path == "/status") {
@@ -342,6 +558,43 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     if (request.method == "GET" && request.path == "/") {
         return {200, "text/html; charset=utf-8", renderHome(), {}};
     }
+
+    if (request.method == "GET" && request.path == "/api/status") {
+        if (!apiAuthorized(request)) {
+            return unauthorized(config_.apiToken.empty() ? "API token not configured" : "Unauthorized");
+        }
+        std::ostringstream out;
+        {
+            std::lock_guard<std::mutex> lock(stateMutex_);
+            out << "{\"status\":";
+            out << jsonString("ok");
+            out << ",\"accounts\":" << accounts_.size();
+            out << ",\"transactions\":" << transactions_.size();
+            out << ",\"lastSync\":" << jsonString(lastSyncSummary_);
+            out << ",\"lastError\":" << jsonString(lastError_);
+            out << "}";
+        }
+        return jsonResponse(200, out.str());
+    }
+    if (request.method == "GET" && request.path == "/api/accounts") {
+        if (!apiAuthorized(request)) {
+            return unauthorized(config_.apiToken.empty() ? "API token not configured" : "Unauthorized");
+        }
+        return jsonResponse(200, renderAccountsJson());
+    }
+    if (request.method == "GET" && request.path == "/api/transactions") {
+        if (!apiAuthorized(request)) {
+            return unauthorized(config_.apiToken.empty() ? "API token not configured" : "Unauthorized");
+        }
+        return jsonResponse(200, renderTransactionsJson());
+    }
+    if (request.method == "GET" && request.path == "/api/balances") {
+        if (!apiAuthorized(request)) {
+            return unauthorized(config_.apiToken.empty() ? "API token not configured" : "Unauthorized");
+        }
+        return jsonResponse(200, renderAccountsJson());
+    }
+
     return {404, "text/plain; charset=utf-8", "not found", {}};
 }
 
@@ -351,9 +604,8 @@ std::string AppServer::renderStatus() const {
     out << "redirect_uri=" << config_.redirectUri << "\n";
     out << "accounts=" << accounts_.size() << "\n";
     out << "transactions=" << transactions_.size() << "\n";
-    out << "last_auth_code=" << (lastAuthCode_.empty() ? "<none>" : lastAuthCode_) << "\n";
+    out << "auth_pending=" << (!expectedAuthState_.empty() ? "yes" : "no") << "\n";
     out << "last_sync=" << (lastSyncSummary_.empty() ? "<none>" : lastSyncSummary_) << "\n";
-    out << "last_webhook=" << (lastWebhookPayload_.empty() ? "<none>" : lastWebhookPayload_) << "\n";
     out << "last_error=" << (lastError_.empty() ? "<none>" : lastError_) << "\n";
     return out.str();
 }
@@ -373,15 +625,64 @@ std::string AppServer::renderHome() const {
     return out.str();
 }
 
+std::string AppServer::renderAccountsJson() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    std::ostringstream out;
+    out << "{\"accounts\":[";
+    for (std::size_t i = 0; i < accounts_.size(); ++i) {
+        const acc& account = accounts_[i];
+        out << "{";
+        out << "\"name\":" << jsonString(account.getName()) << ",";
+        out << "\"balance\":" << account.getBalance() << ",";
+        out << "\"transactions\":" << account.getTransactions().size();
+        out << "}";
+        if (i + 1 < accounts_.size()) {
+            out << ",";
+        }
+    }
+    out << "]}";
+    return out.str();
+}
+
+std::string AppServer::renderTransactionsJson() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    std::ostringstream out;
+    out << "{\"transactions\":[";
+    for (std::size_t i = 0; i < transactions_.size(); ++i) {
+        const trans& transaction = transactions_[i];
+        out << "{";
+        out << "\"name\":" << jsonString(transaction.name) << ",";
+        out << "\"description\":" << jsonString(transaction.opis) << ",";
+        out << "\"amount\":" << transaction.amount << ",";
+        out << "\"currency\":" << jsonString(enumToString(transaction.curr)) << ",";
+        out << "\"from\":" << jsonString(transaction.from) << ",";
+        out << "\"to\":" << jsonString(transaction.to) << ",";
+        out << "\"type\":" << jsonString(enumToString(transaction.type)) << ",";
+        out << "\"category\":" << jsonString("other") << ",";
+        out << "\"date\":" << jsonString(transaction.date) << ",";
+        out << "\"tag\":" << jsonString(enumToString(transaction.tag)) << ",";
+        out << "\"subtransactions\":" << transaction.subtransactions.size();
+        out << "}";
+        if (i + 1 < transactions_.size()) {
+            out << ",";
+        }
+    }
+    out << "]}";
+    return out.str();
+}
+
 std::string AppServer::buildResponse(const HttpResponse& response) {
     std::ostringstream out;
     out << "HTTP/1.1 " << response.status << " ";
     switch (response.status) {
         case 200: out << "OK"; break;
+        case 301: out << "Moved Permanently"; break;
         case 302: out << "Found"; break;
+        case 308: out << "Permanent Redirect"; break;
         case 400: out << "Bad Request"; break;
         case 401: out << "Unauthorized"; break;
         case 404: out << "Not Found"; break;
+        case 415: out << "Unsupported Media Type"; break;
         case 500: out << "Internal Server Error"; break;
         default: out << "OK"; break;
     }
@@ -389,10 +690,20 @@ std::string AppServer::buildResponse(const HttpResponse& response) {
     out << "Content-Type: " << response.contentType << "\r\n";
     out << "Content-Length: " << response.body.size() << "\r\n";
     out << "Connection: close\r\n";
+    out << "Cache-Control: no-store\r\n";
     for (const auto& header : response.headers) {
         out << header.first << ": " << header.second << "\r\n";
     }
     out << "\r\n";
     out << response.body;
     return out.str();
+}
+
+bool AppServer::webhookSecretValid(const HttpRequest& request) const {
+    if (config_.webhookSecret.empty()) {
+        return false;
+    }
+    const std::string headerName = config_.webhookSecretHeader.empty() ? "X-Webhook-Secret" : config_.webhookSecretHeader;
+    const auto it = request.headers.find(headerName);
+    return it != request.headers.end() && constantTimeEquals(it->second, config_.webhookSecret);
 }

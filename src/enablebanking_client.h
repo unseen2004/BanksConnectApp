@@ -11,12 +11,16 @@ struct EnableBankingConfig {
     std::string webhookSecret;
     std::string webhookSecretHeader;
     std::string accessToken;
+    std::string apiToken;
     std::string privateKeyPath;
     std::string appCode;
     std::string jwtIssuer;
     std::string jwtAudience;
     int jwtTtlSeconds = 3600;
     int syncIntervalSeconds = 300;
+    bool enforceHttps = true;
+    bool addHsts = true;
+    bool allowInsecureHttp = false;
     std::string authorizePath;
     std::string consentPath;
     std::string accountsPath;

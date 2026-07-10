@@ -2,6 +2,7 @@
 #include "enablebanking_client.h"
 
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -24,6 +25,20 @@ int envOrInt(const char* key, int fallback) {
     } catch (...) {
         return fallback;
     }
+}
+
+bool envOrBool(const char* key, bool fallback) {
+    const std::string value = envOrEmpty(key);
+    if (value.empty()) {
+        return fallback;
+    }
+    if (value == "1" || value == "true" || value == "TRUE" || value == "yes" || value == "YES" || value == "on" || value == "ON") {
+        return true;
+    }
+    if (value == "0" || value == "false" || value == "FALSE" || value == "no" || value == "NO" || value == "off" || value == "OFF") {
+        return false;
+    }
+    return fallback;
 }
 
 std::string stripScheme(std::string value) {
@@ -157,6 +172,7 @@ void printUsage() {
             << "  AWS_PUBLIC_BASE_URL\n"
             << "  AWS_PUBLIC_URL\n"
             << "  ENABLEBANKING_ACCESS_TOKEN\n"
+            << "  ENABLEBANKING_API_TOKEN\n"
             << "  ENABLEBANKING_PRIVATE_KEY_PATH\n"
             << "  ENABLEBANKING_PRIVATE_KEY_PEM\n"
             << "  ENABLEBANKING_PRIVATE_KEY_PEM_B64\n"
@@ -164,6 +180,9 @@ void printUsage() {
             << "  ENABLEBANKING_JWT_ISSUER\n"
             << "  ENABLEBANKING_JWT_AUDIENCE\n"
             << "  ENABLEBANKING_JWT_TTL_SECONDS\n"
+            << "  ENABLEBANKING_ENFORCE_HTTPS\n"
+            << "  ENABLEBANKING_ADD_HSTS\n"
+            << "  ENABLEBANKING_ALLOW_INSECURE_HTTP\n"
             << "  ENABLEBANKING_WEBHOOK_SECRET\n"
             << "  ENABLEBANKING_WEBHOOK_SECRET_HEADER\n"
             << "  ENABLEBANKING_SYNC_INTERVAL_SECONDS\n"
@@ -183,12 +202,16 @@ EnableBankingConfig loadConfig() {
     config.webhookSecret = envOrEmpty("ENABLEBANKING_WEBHOOK_SECRET");
     config.webhookSecretHeader = envOrEmpty("ENABLEBANKING_WEBHOOK_SECRET_HEADER");
     config.accessToken = envOrEmpty("ENABLEBANKING_ACCESS_TOKEN");
+    config.apiToken = envOrEmpty("ENABLEBANKING_API_TOKEN");
     config.privateKeyPath = materializePrivateKeyPath();
     config.appCode = envOrEmpty("ENABLEBANKING_APP_CODE");
     config.jwtIssuer = envOrEmpty("ENABLEBANKING_JWT_ISSUER");
     config.jwtAudience = envOrEmpty("ENABLEBANKING_JWT_AUDIENCE");
     config.jwtTtlSeconds = envOrInt("ENABLEBANKING_JWT_TTL_SECONDS", 3600);
     config.syncIntervalSeconds = envOrInt("ENABLEBANKING_SYNC_INTERVAL_SECONDS", 300);
+    config.enforceHttps = envOrBool("ENABLEBANKING_ENFORCE_HTTPS", true);
+    config.addHsts = envOrBool("ENABLEBANKING_ADD_HSTS", true);
+    config.allowInsecureHttp = envOrBool("ENABLEBANKING_ALLOW_INSECURE_HTTP", false);
     config.authorizePath = envOrEmpty("ENABLEBANKING_AUTHORIZE_PATH");
     config.consentPath = envOrEmpty("ENABLEBANKING_CONSENT_PATH");
     config.accountsPath = envOrEmpty("ENABLEBANKING_ACCOUNTS_PATH");
