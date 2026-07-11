@@ -190,7 +190,11 @@ void printUsage() {
             << "  ENABLEBANKING_CONSENT_PATH\n"
             << "  ENABLEBANKING_ACCOUNTS_PATH\n"
             << "  ENABLEBANKING_BALANCES_PATH\n"
-            << "  ENABLEBANKING_TRANSACTIONS_PATH\n";
+            << "  ENABLEBANKING_TRANSACTIONS_PATH\n"
+            << "  ENABLEBANKING_ASPSP_NAME\n"
+            << "  ENABLEBANKING_ASPSP_COUNTRY\n"
+            << "  ENABLEBANKING_PSU_TYPE\n"
+            << "  ENABLEBANKING_CONSENT_VALID_DAYS\n";
 }
 
 EnableBankingConfig loadConfig() {
@@ -248,6 +252,15 @@ EnableBankingConfig loadConfig() {
     if (config.transactionsPath.empty()) {
         config.transactionsPath = "/transactions";
     }
+
+    // Enable Banking specific
+    config.aspspName = envOrEmpty("ENABLEBANKING_ASPSP_NAME");
+    config.aspspCountry = envOrEmpty("ENABLEBANKING_ASPSP_COUNTRY");
+    config.psuType = envOrEmpty("ENABLEBANKING_PSU_TYPE");
+    if (config.psuType.empty()) {
+        config.psuType = "personal";
+    }
+    config.consentValidDays = envOrInt("ENABLEBANKING_CONSENT_VALID_DAYS", 90);
 
     return config;
 }

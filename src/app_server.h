@@ -49,6 +49,11 @@ private:
     std::string lastSyncSummary_;
     std::string lastError_;
 
+    // Enable Banking session state
+    std::string sessionId_;
+    std::vector<std::string> accountIds_;  // account UUIDs from POST /sessions
+    std::string authorizationId_;          // from POST /auth
+
     void startSyncLoop();
     void syncOnce(const std::string& reason);
     void serve(int port);

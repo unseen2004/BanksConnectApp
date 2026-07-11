@@ -60,6 +60,9 @@ void AppServer::run() {
     if (config_.accessToken.empty() && (config_.privateKeyPath.empty() || config_.appCode.empty())) {
         throw std::runtime_error("Set ENABLEBANKING_ACCESS_TOKEN or ENABLEBANKING_PRIVATE_KEY_PATH and ENABLEBANKING_APP_CODE");
     }
+    if (config_.aspspName.empty() || config_.aspspCountry.empty()) {
+        std::cout << "Warning: ENABLEBANKING_ASPSP_NAME / ENABLEBANKING_ASPSP_COUNTRY not set; /start-auth will fail." << std::endl;
+    }
 
     std::cout << "Starting service on port " << port << std::endl;
     std::cout << "Callback URL: " << config_.redirectUri << std::endl;
@@ -89,25 +92,76 @@ void AppServer::startSyncLoop() {
 }
 
 void AppServer::syncOnce(const std::string& reason) {
-    const ::HttpResponse accountsResponse = client_.getAccounts();
-    const ::HttpResponse balancesResponse = client_.getBalances();
-    const ::HttpResponse transactionsResponse = client_.getTransactions();
-
-    std::vector<acc> accounts = parseAccounts(accountsResponse.body);
-    std::vector<trans> transactions = parseTransactions(transactionsResponse.body);
-
-    if (!accounts.empty()) {
-        for (const trans& transaction : transactions) {
-            accounts.front().addTransaction(transaction);
-        }
+    // Check if we have a valid Enable Banking session with account IDs
+    std::vector<std::string> ids;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        ids = accountIds_;
     }
 
+    std::vector<acc> accounts;
+    std::vector<trans> transactions;
     std::ostringstream summary;
-    summary << "reason=" << reason
-            << " accounts_status=" << accountsResponse.statusCode
-            << " balances_status=" << balancesResponse.statusCode
-            << " transactions_status=" << transactionsResponse.statusCode
-            << " accounts=" << accounts.size()
+    summary << "reason=" << reason;
+
+    if (!ids.empty()) {
+        // Use proper per-account Enable Banking endpoints
+        for (const std::string& accountId : ids) {
+            const ::HttpResponse balResp = client_.getAccountBalances(accountId);
+            const ::HttpResponse txResp = client_.getAccountTransactions(accountId);
+
+            summary << " account=" << accountId
+                    << " bal_status=" << balResp.statusCode
+                    << " tx_status=" << txResp.statusCode;
+
+            // Parse balance — extract amount from first balance entry
+            std::string balanceStr = "0";
+            {
+                const std::size_t amountPos = balResp.body.find("\"amount\"");
+                if (amountPos != std::string::npos) {
+                    const std::size_t colonPos = balResp.body.find(':', amountPos);
+                    if (colonPos != std::string::npos) {
+                        std::size_t valStart = balResp.body.find_first_not_of(" \t\r\n", colonPos + 1);
+                        if (valStart != std::string::npos) {
+                            if (balResp.body[valStart] == '"') ++valStart;
+                            std::size_t valEnd = balResp.body.find_first_of(",}\"\r\n", valStart);
+                            balanceStr = balResp.body.substr(valStart, valEnd - valStart);
+                        }
+                    }
+                }
+            }
+            int balance = 0;
+            try { balance = static_cast<int>(std::stod(balanceStr)); } catch (...) {}
+
+            accounts.emplace_back(accountId, balance);
+
+            std::vector<trans> acctTx = parseTransactions(txResp.body);
+            for (const trans& t : acctTx) {
+                accounts.back().addTransaction(t);
+                transactions.push_back(t);
+            }
+        }
+    } else {
+        // Fallback to legacy generic endpoints (before session is established)
+        const ::HttpResponse accountsResponse = client_.getAccounts();
+        const ::HttpResponse balancesResponse = client_.getBalances();
+        const ::HttpResponse transactionsResponse = client_.getTransactions();
+
+        accounts = parseAccounts(accountsResponse.body);
+        transactions = parseTransactions(transactionsResponse.body);
+
+        if (!accounts.empty()) {
+            for (const trans& transaction : transactions) {
+                accounts.front().addTransaction(transaction);
+            }
+        }
+
+        summary << " accounts_status=" << accountsResponse.statusCode
+                << " balances_status=" << balancesResponse.statusCode
+                << " transactions_status=" << transactionsResponse.statusCode;
+    }
+
+    summary << " accounts=" << accounts.size()
             << " transactions=" << transactions.size();
 
     std::lock_guard<std::mutex> lock(stateMutex_);
@@ -475,11 +529,13 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     if (request.method == "GET" && request.path == "/auth/url") {
         try {
             const std::string state = generateStateToken();
+            const StartAuthResult authResult = client_.startAuthorization(state);
             {
                 std::lock_guard<std::mutex> lock(stateMutex_);
                 expectedAuthState_ = state;
+                authorizationId_ = authResult.authorizationId;
             }
-            return {200, "text/plain; charset=utf-8", client_.authorizationUrl(state, "accounts transactions balances"), {}};
+            return {200, "text/plain; charset=utf-8", authResult.url, {}};
         } catch (const std::exception& error) {
             std::lock_guard<std::mutex> lock(stateMutex_);
             lastError_ = error.what();
@@ -489,11 +545,13 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     if (request.method == "GET" && request.path == "/start-auth") {
         try {
             const std::string state = generateStateToken();
+            const StartAuthResult authResult = client_.startAuthorization(state);
             {
                 std::lock_guard<std::mutex> lock(stateMutex_);
                 expectedAuthState_ = state;
+                authorizationId_ = authResult.authorizationId;
             }
-            return {302, "text/plain; charset=utf-8", "redirecting", {{"Location", client_.authorizationUrl(state, "accounts transactions balances")}}};
+            return {302, "text/plain; charset=utf-8", "redirecting", {{"Location", authResult.url}}};
         } catch (const std::exception& error) {
             std::lock_guard<std::mutex> lock(stateMutex_);
             lastError_ = error.what();
@@ -502,9 +560,10 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     }
     if (request.method == "GET" && request.path == "/oauth/callback") {
         if (query.count("error") != 0) {
+            const std::string errDesc = query.count("error_description") != 0 ? query.at("error_description") : "";
             std::lock_guard<std::mutex> lock(stateMutex_);
-            lastError_ = query.at("error");
-            return {400, "text/plain; charset=utf-8", "OAuth error: " + query.at("error"), {}};
+            lastError_ = query.at("error") + (errDesc.empty() ? "" : ": " + errDesc);
+            return {400, "text/plain; charset=utf-8", "OAuth error: " + lastError_, {}};
         }
         const std::string code = query.count("code") != 0 ? query.at("code") : std::string();
         const std::string state = query.count("state") != 0 ? query.at("state") : std::string();
@@ -515,10 +574,38 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                 return {400, "text/plain; charset=utf-8", "Invalid OAuth state", {}};
             }
             lastAuthCode_ = code;
-            lastError_.clear();
             expectedAuthState_.clear();
         }
-        return {200, "text/plain; charset=utf-8", "Authorization received. You can close this tab.", {}};
+
+        // Step 2: Exchange the code for a session via POST /sessions
+        if (!code.empty()) {
+            try {
+                const SessionResult session = client_.createSession(code);
+                {
+                    std::lock_guard<std::mutex> lock(stateMutex_);
+                    sessionId_ = session.sessionId;
+                    accountIds_ = session.accountIds;
+                    lastError_.clear();
+                }
+                // Immediately sync data now that we have a session
+                try {
+                    syncOnce("auth-callback");
+                } catch (const std::exception& syncErr) {
+                    std::lock_guard<std::mutex> lock(stateMutex_);
+                    lastError_ = std::string("sync after auth: ") + syncErr.what();
+                }
+                return {200, "text/html; charset=utf-8",
+                        "<html><body><h2>Authorization successful!</h2>"
+                        "<p>Session established. Accounts: " + std::to_string(session.accountIds.size()) + "</p>"
+                        "<p><a href=\"/\">Go to dashboard</a></p>"
+                        "</body></html>", {}};
+            } catch (const std::exception& error) {
+                std::lock_guard<std::mutex> lock(stateMutex_);
+                lastError_ = std::string("POST /sessions failed: ") + error.what();
+                return {500, "text/plain; charset=utf-8", "Session creation failed: " + std::string(error.what()), {}};
+            }
+        }
+        return {200, "text/plain; charset=utf-8", "Authorization received (no code). You can close this tab.", {}};
     }
     if (request.method == "POST" && request.path == "/webhook") {
         if (!webhookSecretValid(request)) {
@@ -602,6 +689,9 @@ std::string AppServer::renderStatus() const {
     std::lock_guard<std::mutex> lock(stateMutex_);
     std::ostringstream out;
     out << "redirect_uri=" << config_.redirectUri << "\n";
+    out << "aspsp=" << config_.aspspName << " (" << config_.aspspCountry << ")\n";
+    out << "session_id=" << (sessionId_.empty() ? "<none>" : sessionId_) << "\n";
+    out << "eb_accounts=" << accountIds_.size() << "\n";
     out << "accounts=" << accounts_.size() << "\n";
     out << "transactions=" << transactions_.size() << "\n";
     out << "auth_pending=" << (!expectedAuthState_.empty() ? "yes" : "no") << "\n";
