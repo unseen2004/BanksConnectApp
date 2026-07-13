@@ -309,8 +309,14 @@ std::string EnableBankingClient::authorizationUrl(const std::string& state, cons
 // ===== Enable Banking proper flow =====
 
 StartAuthResult EnableBankingClient::startAuthorization(const std::string& state) const {
-    if (config_.aspspName.empty() || config_.aspspCountry.empty()) {
-        throw std::runtime_error("ENABLEBANKING_ASPSP_NAME and ENABLEBANKING_ASPSP_COUNTRY are required for authorization");
+    return startAuthorization(state, config_.aspspName, config_.aspspCountry);
+}
+
+StartAuthResult EnableBankingClient::startAuthorization(const std::string& state,
+                                                         const std::string& aspspName,
+                                                         const std::string& aspspCountry) const {
+    if (aspspName.empty() || aspspCountry.empty()) {
+        throw std::runtime_error("ASPSP name and country are required for authorization");
     }
     if (config_.redirectUri.empty()) {
         throw std::runtime_error("ENABLEBANKING_REDIRECT_URI or PUBLIC_BASE_URL is required");
@@ -334,8 +340,8 @@ StartAuthResult EnableBankingClient::startAuthorization(const std::string& state
     body += ",\"transactions\":true";
     body += "},";
     body += "\"aspsp\":{";
-    body += "\"name\":\"" + jsonEscape(config_.aspspName) + "\"";
-    body += ",\"country\":\"" + jsonEscape(config_.aspspCountry) + "\"";
+    body += "\"name\":\"" + jsonEscape(aspspName) + "\"";
+    body += ",\"country\":\"" + jsonEscape(aspspCountry) + "\"";
     body += "},";
     body += "\"state\":\"" + jsonEscape(state) + "\",";
     body += "\"redirect_url\":\"" + jsonEscape(config_.redirectUri) + "\",";

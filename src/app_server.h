@@ -49,10 +49,17 @@ private:
     std::string lastSyncSummary_;
     std::string lastError_;
 
-    // Enable Banking session state
-    std::string sessionId_;
-    std::vector<std::string> accountIds_;  // account UUIDs from POST /sessions
-    std::string authorizationId_;          // from POST /auth
+    // Enable Banking session state — supports multiple banks
+    struct BankSession {
+        std::string aspspName;
+        std::string aspspCountry;
+        std::string sessionId;
+        std::string authorizationId;
+        std::vector<std::string> accountIds;
+    };
+    std::vector<BankSession> bankSessions_;
+    std::string pendingAuthAspsp_;    // ASPSP name for the auth flow in progress
+    std::string pendingAuthCountry_;  // country for the auth flow in progress
 
     void startSyncLoop();
     void syncOnce(const std::string& reason);

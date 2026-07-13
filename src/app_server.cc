@@ -92,11 +92,15 @@ void AppServer::startSyncLoop() {
 }
 
 void AppServer::syncOnce(const std::string& reason) {
-    // Check if we have a valid Enable Banking session with account IDs
+    // Collect all account IDs from all bank sessions
     std::vector<std::string> ids;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
-        ids = accountIds_;
+        for (const auto& session : bankSessions_) {
+            for (const auto& id : session.accountIds) {
+                ids.push_back(id);
+            }
+        }
     }
 
     std::vector<acc> accounts;
@@ -528,12 +532,15 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     }
     if (request.method == "GET" && request.path == "/auth/url") {
         try {
+            const std::string aspsp = query.count("aspsp") ? query.at("aspsp") : config_.aspspName;
+            const std::string country = query.count("country") ? query.at("country") : config_.aspspCountry;
             const std::string state = generateStateToken();
-            const StartAuthResult authResult = client_.startAuthorization(state);
+            const StartAuthResult authResult = client_.startAuthorization(state, aspsp, country);
             {
                 std::lock_guard<std::mutex> lock(stateMutex_);
                 expectedAuthState_ = state;
-                authorizationId_ = authResult.authorizationId;
+                pendingAuthAspsp_ = aspsp;
+                pendingAuthCountry_ = country;
             }
             return {200, "text/plain; charset=utf-8", authResult.url, {}};
         } catch (const std::exception& error) {
@@ -544,12 +551,15 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     }
     if (request.method == "GET" && request.path == "/start-auth") {
         try {
+            const std::string aspsp = query.count("aspsp") ? query.at("aspsp") : config_.aspspName;
+            const std::string country = query.count("country") ? query.at("country") : config_.aspspCountry;
             const std::string state = generateStateToken();
-            const StartAuthResult authResult = client_.startAuthorization(state);
+            const StartAuthResult authResult = client_.startAuthorization(state, aspsp, country);
             {
                 std::lock_guard<std::mutex> lock(stateMutex_);
                 expectedAuthState_ = state;
-                authorizationId_ = authResult.authorizationId;
+                pendingAuthAspsp_ = aspsp;
+                pendingAuthCountry_ = country;
             }
             return {302, "text/plain; charset=utf-8", "redirecting", {{"Location", authResult.url}}};
         } catch (const std::exception& error) {
@@ -581,10 +591,29 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
         if (!code.empty()) {
             try {
                 const SessionResult session = client_.createSession(code);
+                std::string connectedBank;
                 {
                     std::lock_guard<std::mutex> lock(stateMutex_);
-                    sessionId_ = session.sessionId;
-                    accountIds_ = session.accountIds;
+                    BankSession bs;
+                    bs.aspspName = pendingAuthAspsp_;
+                    bs.aspspCountry = pendingAuthCountry_;
+                    bs.sessionId = session.sessionId;
+                    bs.accountIds = session.accountIds;
+                    connectedBank = bs.aspspName;
+                    // Replace existing session for same bank, or add new
+                    bool replaced = false;
+                    for (auto& existing : bankSessions_) {
+                        if (existing.aspspName == bs.aspspName && existing.aspspCountry == bs.aspspCountry) {
+                            existing = bs;
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    if (!replaced) {
+                        bankSessions_.push_back(bs);
+                    }
+                    pendingAuthAspsp_.clear();
+                    pendingAuthCountry_.clear();
                     lastError_.clear();
                 }
                 // Immediately sync data now that we have a session
@@ -596,6 +625,7 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                 }
                 return {200, "text/html; charset=utf-8",
                         "<html><body><h2>Authorization successful!</h2>"
+                        "<p>Bank: " + htmlEscape(connectedBank) + "</p>"
                         "<p>Session established. Accounts: " + std::to_string(session.accountIds.size()) + "</p>"
                         "<p><a href=\"/\">Go to dashboard</a></p>"
                         "</body></html>", {}};
@@ -689,11 +719,14 @@ std::string AppServer::renderStatus() const {
     std::lock_guard<std::mutex> lock(stateMutex_);
     std::ostringstream out;
     out << "redirect_uri=" << config_.redirectUri << "\n";
-    out << "aspsp=" << config_.aspspName << " (" << config_.aspspCountry << ")\n";
-    out << "session_id=" << (sessionId_.empty() ? "<none>" : sessionId_) << "\n";
-    out << "eb_accounts=" << accountIds_.size() << "\n";
-    out << "accounts=" << accounts_.size() << "\n";
-    out << "transactions=" << transactions_.size() << "\n";
+    out << "connected_banks=" << bankSessions_.size() << "\n";
+    for (std::size_t i = 0; i < bankSessions_.size(); ++i) {
+        const auto& s = bankSessions_[i];
+        out << "bank[" << i << "]=" << s.aspspName << " (" << s.aspspCountry << ")"
+            << " session=" << s.sessionId << " accounts=" << s.accountIds.size() << "\n";
+    }
+    out << "total_accounts=" << accounts_.size() << "\n";
+    out << "total_transactions=" << transactions_.size() << "\n";
     out << "auth_pending=" << (!expectedAuthState_.empty() ? "yes" : "no") << "\n";
     out << "last_sync=" << (lastSyncSummary_.empty() ? "<none>" : lastSyncSummary_) << "\n";
     out << "last_error=" << (lastError_.empty() ? "<none>" : lastError_) << "\n";
@@ -704,13 +737,17 @@ std::string AppServer::renderHome() const {
     std::ostringstream out;
     out << "<html><body>";
     out << "<h1>BanksConnectApp</h1>";
+    out << "<h3>Connect a bank:</h3>";
     out << "<ul>";
-    out << "<li><a href=\"/health\">/health</a></li>";
-    out << "<li><a href=\"/auth/url\">/auth/url</a></li>";
-    out << "<li><a href=\"/start-auth\">/start-auth</a></li>";
-    out << "<li><a href=\"/status\">/status</a></li>";
+    out << "<li><a href=\"/start-auth?aspsp=Bank%20Millennium&country=PL\">Bank Millennium</a></li>";
+    out << "<li><a href=\"/start-auth?aspsp=PKO&country=PL\">PKO BP</a></li>";
+    out << "<li><a href=\"/start-auth?aspsp=mBank&country=PL\">mBank</a></li>";
+    out << "<li><a href=\"/start-auth?aspsp=ING&country=PL\">ING</a></li>";
+    out << "<li><a href=\"/start-auth?aspsp=Santander&country=PL\">Santander</a></li>";
     out << "</ul>";
+    out << "<h3>Status:</h3>";
     out << "<pre>" << htmlEscape(renderStatus()) << "</pre>";
+    out << "<p><a href=\"/health\">/health</a> | <a href=\"/status\">/status</a></p>";
     out << "</body></html>";
     return out.str();
 }

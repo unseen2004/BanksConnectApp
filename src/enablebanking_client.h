@@ -65,6 +65,11 @@ public:
     /// Step 1: POST /auth — start authorization, returns redirect URL for the PSU.
     StartAuthResult startAuthorization(const std::string& state) const;
 
+    /// Overload: start authorization with a specific ASPSP (for multi-bank support).
+    StartAuthResult startAuthorization(const std::string& state,
+                                       const std::string& aspspName,
+                                       const std::string& aspspCountry) const;
+
     /// Step 2: POST /sessions — exchange the callback code for a session.
     SessionResult createSession(const std::string& code) const;
 
