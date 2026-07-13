@@ -63,6 +63,8 @@ private:
 
     void startSyncLoop();
     void syncOnce(const std::string& reason);
+    void saveSessions() const;
+    void loadSessions();
     void serve(int port);
     HttpResponse handleRequest(const HttpRequest& request);
     HttpResponse redirectToHttps(const HttpRequest& request) const;

@@ -194,7 +194,8 @@ void printUsage() {
             << "  ENABLEBANKING_ASPSP_NAME\n"
             << "  ENABLEBANKING_ASPSP_COUNTRY\n"
             << "  ENABLEBANKING_PSU_TYPE\n"
-            << "  ENABLEBANKING_CONSENT_VALID_DAYS\n";
+            << "  ENABLEBANKING_CONSENT_VALID_DAYS\n"
+            << "  ENABLEBANKING_DATA_DIR\n";
 }
 
 EnableBankingConfig loadConfig() {
@@ -261,6 +262,7 @@ EnableBankingConfig loadConfig() {
         config.psuType = "personal";
     }
     config.consentValidDays = envOrInt("ENABLEBANKING_CONSENT_VALID_DAYS", 90);
+    config.dataDir = envOrEmpty("ENABLEBANKING_DATA_DIR");
 
     return config;
 }

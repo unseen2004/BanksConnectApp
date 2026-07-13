@@ -67,6 +67,9 @@ void AppServer::run() {
     std::cout << "Starting service on port " << port << std::endl;
     std::cout << "Callback URL: " << config_.redirectUri << std::endl;
 
+    // Load persisted sessions from disk
+    loadSessions();
+
     running_ = true;
     startSyncLoop();
     serve(port);
@@ -173,6 +176,125 @@ void AppServer::syncOnce(const std::string& reason) {
     transactions_ = std::move(transactions);
     lastSyncSummary_ = summary.str();
     lastError_.clear();
+}
+
+void AppServer::saveSessions() const {
+    if (config_.dataDir.empty()) {
+        return;
+    }
+    const std::string filePath = config_.dataDir + "/sessions.json";
+    std::ostringstream out;
+    out << "{\"sessions\":[";
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        for (std::size_t i = 0; i < bankSessions_.size(); ++i) {
+            const auto& s = bankSessions_[i];
+            if (i > 0) out << ",";
+            out << "{\"aspsp_name\":" << jsonString(s.aspspName)
+                << ",\"aspsp_country\":" << jsonString(s.aspspCountry)
+                << ",\"session_id\":" << jsonString(s.sessionId)
+                << ",\"authorization_id\":" << jsonString(s.authorizationId)
+                << ",\"account_ids\":[";
+            for (std::size_t j = 0; j < s.accountIds.size(); ++j) {
+                if (j > 0) out << ",";
+                out << jsonString(s.accountIds[j]);
+            }
+            out << "]}";
+        }
+    }
+    out << "]}";
+
+    std::ofstream file(filePath);
+    if (file.is_open()) {
+        file << out.str();
+        file.close();
+        std::cout << "[EB] Sessions saved to " << filePath << std::endl;
+    } else {
+        std::cerr << "[EB] Failed to save sessions to " << filePath << std::endl;
+    }
+}
+
+void AppServer::loadSessions() {
+    if (config_.dataDir.empty()) {
+        return;
+    }
+    const std::string filePath = config_.dataDir + "/sessions.json";
+    std::ifstream file(filePath);
+    if (!file.is_open()) {
+        std::cout << "[EB] No saved sessions at " << filePath << std::endl;
+        return;
+    }
+
+    std::string content((std::istreambuf_iterator<char>(file)),
+                         std::istreambuf_iterator<char>());
+    file.close();
+
+    // Simple JSON parser for our sessions format
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    bankSessions_.clear();
+
+    // Find each session object
+    std::size_t pos = 0;
+    while (true) {
+        pos = content.find("\"aspsp_name\"", pos);
+        if (pos == std::string::npos) break;
+
+        BankSession bs;
+
+        // Extract aspsp_name
+        auto extractStr = [&](const std::string& key, std::size_t searchFrom) -> std::string {
+            std::size_t kp = content.find("\"" + key + "\"", searchFrom);
+            if (kp == std::string::npos) return "";
+            std::size_t cp = content.find(':', kp);
+            if (cp == std::string::npos) return "";
+            std::size_t qs = content.find('"', cp + 1);
+            if (qs == std::string::npos) return "";
+            std::size_t qe = content.find('"', qs + 1);
+            if (qe == std::string::npos) return "";
+            return content.substr(qs + 1, qe - qs - 1);
+        };
+
+        // Find the end of this session object
+        std::size_t objEnd = content.find(']', pos);
+        if (objEnd == std::string::npos) objEnd = content.size();
+        std::size_t nextObj = content.find("\"aspsp_name\"", pos + 1);
+        std::size_t searchEnd = (nextObj != std::string::npos && nextObj < objEnd) ? nextObj : objEnd;
+        (void)searchEnd;
+
+        bs.aspspName = extractStr("aspsp_name", pos);
+        bs.aspspCountry = extractStr("aspsp_country", pos);
+        bs.sessionId = extractStr("session_id", pos);
+        bs.authorizationId = extractStr("authorization_id", pos);
+
+        // Extract account_ids array
+        std::size_t arrStart = content.find("\"account_ids\"", pos);
+        if (arrStart != std::string::npos && arrStart < objEnd) {
+            std::size_t bracket = content.find('[', arrStart);
+            std::size_t bracketEnd = content.find(']', bracket);
+            if (bracket != std::string::npos && bracketEnd != std::string::npos) {
+                std::string arr = content.substr(bracket + 1, bracketEnd - bracket - 1);
+                std::size_t ap = 0;
+                while (true) {
+                    std::size_t qs2 = arr.find('"', ap);
+                    if (qs2 == std::string::npos) break;
+                    std::size_t qe2 = arr.find('"', qs2 + 1);
+                    if (qe2 == std::string::npos) break;
+                    bs.accountIds.push_back(arr.substr(qs2 + 1, qe2 - qs2 - 1));
+                    ap = qe2 + 1;
+                }
+            }
+        }
+
+        if (!bs.sessionId.empty()) {
+            std::cout << "[EB] Loaded session: " << bs.aspspName << " (" << bs.aspspCountry
+                      << ") session=" << bs.sessionId << " accounts=" << bs.accountIds.size() << std::endl;
+            bankSessions_.push_back(bs);
+        }
+
+        pos += 10; // advance past current match
+    }
+
+    std::cout << "[EB] Loaded " << bankSessions_.size() << " saved sessions" << std::endl;
 }
 
 void AppServer::serve(int port) {
@@ -616,6 +738,8 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                     pendingAuthCountry_.clear();
                     lastError_.clear();
                 }
+                // Persist sessions to disk
+                saveSessions();
                 // Immediately sync data now that we have a session
                 try {
                     syncOnce("auth-callback");

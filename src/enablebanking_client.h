@@ -33,6 +33,7 @@ struct EnableBankingConfig {
     std::string aspspCountry;  // e.g. "FI", "PL"
     std::string psuType;       // "personal" or "business"
     int consentValidDays = 90; // how many days the consent is valid
+    std::string dataDir;       // directory for persistent data (sessions.json)
 };
 
 struct HttpResponse {
