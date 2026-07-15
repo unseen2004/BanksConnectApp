@@ -136,7 +136,7 @@ void AppServer::syncOnce(const std::string& reason) {
                         std::size_t valStart = balResp.body.find_first_not_of(" \t\r\n", colonPos + 1);
                         if (valStart != std::string::npos) {
                             if (balResp.body[valStart] == '"') ++valStart;
-                            std::size_t valEnd = balResp.body.find_first_of(",}\"\r\n", valStart);
+                            std::size_t valEnd = balResp.body.find_first_of(",}\"\\r\\n", valStart);
                             balanceStr = balResp.body.substr(valStart, valEnd - valStart);
                         }
                     }
@@ -301,9 +301,9 @@ void AppServer::loadSessions() {
         std::size_t searchEnd = (nextObj != std::string::npos && nextObj < objEnd) ? nextObj : objEnd;
         (void)searchEnd;
 
-        bs.aspspName = extractStr("aspsp_name", pos);
+        bs.aspspName    = extractStr("aspsp_name",    pos);
         bs.aspspCountry = extractStr("aspsp_country", pos);
-        bs.sessionId = extractStr("session_id", pos);
+        bs.sessionId    = extractStr("session_id",    pos);
         bs.authorizationId = extractStr("authorization_id", pos);
 
         std::size_t arrStart = content.find("\"account_ids\"", pos);
@@ -362,9 +362,7 @@ void AppServer::serve(int port) {
     while (running_) {
         const int clientFd = ::accept(serverFd, nullptr, nullptr);
         if (clientFd < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
+            if (errno == EINTR) continue;
             break;
         }
 
@@ -393,14 +391,10 @@ std::string AppServer::readRequest(int clientFd) {
     while (true) {
         const ssize_t bytesRead = ::recv(clientFd, buffer, sizeof(buffer), 0);
         if (bytesRead < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
+            if (errno == EINTR) continue;
             break;
         }
-        if (bytesRead == 0) {
-            break;
-        }
+        if (bytesRead == 0) break;
         request.append(buffer, static_cast<std::size_t>(bytesRead));
         const std::size_t headerEnd = request.find("\r\n\r\n");
         if (!headersComplete && headerEnd != std::string::npos) {
@@ -416,9 +410,7 @@ std::string AppServer::readRequest(int clientFd) {
         if (headersComplete) {
             const std::size_t bodyStart = request.find("\r\n\r\n");
             const std::size_t bodySize = request.size() - (bodyStart + 4);
-            if (bodySize >= contentLength) {
-                break;
-            }
+            if (bodySize >= contentLength) break;
         }
     }
     return request;
@@ -427,38 +419,30 @@ std::string AppServer::readRequest(int clientFd) {
 AppServer::HttpRequest AppServer::parseRequest(const std::string& rawRequest) {
     HttpRequest request;
     const std::size_t requestLineEnd = rawRequest.find("\r\n");
-    if (requestLineEnd == std::string::npos) {
-        return request;
-    }
+    if (requestLineEnd == std::string::npos) return request;
     const std::string requestLine = rawRequest.substr(0, requestLineEnd);
     std::istringstream lineStream(requestLine);
     lineStream >> request.method >> request.target;
 
     const std::size_t queryPos = request.target.find('?');
-    request.path = queryPos == std::string::npos ? request.target : request.target.substr(0, queryPos);
+    request.path  = queryPos == std::string::npos ? request.target : request.target.substr(0, queryPos);
     request.query = queryPos == std::string::npos ? std::string() : request.target.substr(queryPos + 1);
 
     const std::size_t headerStart = requestLineEnd + 2;
     const std::size_t bodyPos = rawRequest.find("\r\n\r\n");
-    const std::string headerBlock = bodyPos == std::string::npos ? rawRequest.substr(headerStart) : rawRequest.substr(headerStart, bodyPos - headerStart);
+    const std::string headerBlock = bodyPos == std::string::npos
+        ? rawRequest.substr(headerStart)
+        : rawRequest.substr(headerStart, bodyPos - headerStart);
     std::istringstream headersStream(headerBlock);
     std::string headerLine;
     while (std::getline(headersStream, headerLine)) {
-        if (!headerLine.empty() && headerLine.back() == '\r') {
-            headerLine.pop_back();
-        }
+        if (!headerLine.empty() && headerLine.back() == '\r') headerLine.pop_back();
         const std::size_t colonPos = headerLine.find(':');
-        if (colonPos == std::string::npos) {
-            continue;
-        }
-        const std::string key = trim(headerLine.substr(0, colonPos));
-        const std::string value = trim(headerLine.substr(colonPos + 1));
-        request.headers[key] = value;
+        if (colonPos == std::string::npos) continue;
+        request.headers[trim(headerLine.substr(0, colonPos))] = trim(headerLine.substr(colonPos + 1));
     }
 
-    if (bodyPos != std::string::npos) {
-        request.body = rawRequest.substr(bodyPos + 4);
-    }
+    if (bodyPos != std::string::npos) request.body = rawRequest.substr(bodyPos + 4);
     return request;
 }
 
@@ -468,8 +452,7 @@ std::string AppServer::decodeUrl(const std::string& value) {
     for (std::size_t i = 0; i < value.size(); ++i) {
         if (value[i] == '%' && i + 2 < value.size()) {
             const std::string hex = value.substr(i + 1, 2);
-            const char ch = static_cast<char>(std::strtol(hex.c_str(), nullptr, 16));
-            decoded.push_back(ch);
+            decoded.push_back(static_cast<char>(std::strtol(hex.c_str(), nullptr, 16)));
             i += 2;
         } else if (value[i] == '+') {
             decoded.push_back(' ');
@@ -487,14 +470,10 @@ std::map<std::string, std::string> AppServer::parseQuery(const std::string& quer
         const std::size_t amp = query.find('&', start);
         const std::string pair = query.substr(start, amp == std::string::npos ? std::string::npos : amp - start);
         const std::size_t eq = pair.find('=');
-        const std::string key = decodeUrl(eq == std::string::npos ? pair : pair.substr(0, eq));
+        const std::string key   = decodeUrl(eq == std::string::npos ? pair : pair.substr(0, eq));
         const std::string value = decodeUrl(eq == std::string::npos ? std::string() : pair.substr(eq + 1));
-        if (!key.empty()) {
-            result[key] = value;
-        }
-        if (amp == std::string::npos) {
-            break;
-        }
+        if (!key.empty()) result[key] = value;
+        if (amp == std::string::npos) break;
         start = amp + 1;
     }
     return result;
@@ -505,25 +484,22 @@ std::string AppServer::htmlEscape(const std::string& value) {
     escaped.reserve(value.size());
     for (const char ch : value) {
         switch (ch) {
-            case '&': escaped += "&amp;"; break;
-            case '<': escaped += "&lt;"; break;
-            case '>': escaped += "&gt;"; break;
-            case '"': escaped += "&quot;"; break;
-            case '\'': escaped += "&#39;"; break;
-            default: escaped.push_back(ch); break;
+            case '&':  escaped += "&amp;";  break;
+            case '<':  escaped += "&lt;";   break;
+            case '>':  escaped += "&gt;";   break;
+            case '"':  escaped += "&quot;"; break;
+            case '\'': escaped += "&#39;";  break;
+            default:   escaped.push_back(ch); break;
         }
     }
     return escaped;
 }
 
 bool AppServer::constantTimeEquals(const std::string& left, const std::string& right) {
-    if (left.size() != right.size()) {
-        return false;
-    }
+    if (left.size() != right.size()) return false;
     unsigned char diff = 0;
-    for (std::size_t i = 0; i < left.size(); ++i) {
+    for (std::size_t i = 0; i < left.size(); ++i)
         diff |= static_cast<unsigned char>(left[i] ^ right[i]);
-    }
     return diff == 0;
 }
 
@@ -533,13 +509,13 @@ std::string AppServer::jsonEscape(const std::string& value) {
     for (const char ch : value) {
         switch (ch) {
             case '\\': escaped += "\\\\"; break;
-            case '"': escaped += "\\\""; break;
-            case '\b': escaped += "\\b"; break;
-            case '\f': escaped += "\\f"; break;
-            case '\n': escaped += "\\n"; break;
-            case '\r': escaped += "\\r"; break;
-            case '\t': escaped += "\\t"; break;
-            default: escaped.push_back(ch); break;
+            case '"':  escaped += "\\\""; break;
+            case '\b': escaped += "\\b";  break;
+            case '\f': escaped += "\\f";  break;
+            case '\n': escaped += "\\n";  break;
+            case '\r': escaped += "\\r";  break;
+            case '\t': escaped += "\\t";  break;
+            default:   escaped.push_back(ch); break;
         }
     }
     return escaped;
@@ -560,58 +536,39 @@ std::string AppServer::enumToString(my::currency currency) {
 
 std::string AppServer::enumToString(my::type type) {
     switch (type) {
-        case my::type::income: return "income";
+        case my::type::income:  return "income";
         case my::type::expense: return "expense";
-        case my::type::inside: return "inside";
+        case my::type::inside:  return "inside";
     }
     return "expense";
 }
 
 std::string AppServer::enumToString(my::tag tag) {
     switch (tag) {
-        case my::tag::must: return "must";
-        case my::tag::opt: return "opt";
+        case my::tag::must:  return "must";
+        case my::tag::opt:   return "opt";
         case my::tag::waste: return "waste";
     }
     return "opt";
 }
 
 bool AppServer::requestIsSecure(const HttpRequest& request) const {
-    if (config_.allowInsecureHttp) {
-        return true;
-    }
+    if (config_.allowInsecureHttp) return true;
     const auto it = request.headers.find("X-Forwarded-Proto");
-    if (it != request.headers.end()) {
-        const std::string proto = lowerCopy(it->second);
-        if (proto.find("https") != std::string::npos) {
-            return true;
-        }
-    }
+    if (it != request.headers.end() && lowerCopy(it->second).find("https") != std::string::npos) return true;
     const auto forwarded = request.headers.find("Forwarded");
-    if (forwarded != request.headers.end()) {
-        const std::string forwardedValue = lowerCopy(forwarded->second);
-        if (forwardedValue.find("proto=https") != std::string::npos) {
-            return true;
-        }
-    }
+    if (forwarded != request.headers.end() && lowerCopy(forwarded->second).find("proto=https") != std::string::npos) return true;
     const auto ssl = request.headers.find("X-Forwarded-Ssl");
-    if (ssl != request.headers.end() && lowerCopy(ssl->second) == "on") {
-        return true;
-    }
+    if (ssl != request.headers.end() && lowerCopy(ssl->second) == "on") return true;
     return false;
 }
 
 std::string AppServer::configuredPublicBaseUrl() const {
     const std::string& uri = config_.redirectUri;
     const std::size_t schemePos = uri.find("://");
-    if (schemePos == std::string::npos) {
-        return std::string();
-    }
+    if (schemePos == std::string::npos) return std::string();
     const std::size_t pathPos = uri.find('/', schemePos + 3);
-    if (pathPos == std::string::npos) {
-        return uri;
-    }
-    return uri.substr(0, pathPos);
+    return pathPos == std::string::npos ? uri : uri.substr(0, pathPos);
 }
 
 std::string AppServer::buildHttpsUrl(const HttpRequest& request) const {
@@ -621,20 +578,13 @@ std::string AppServer::buildHttpsUrl(const HttpRequest& request) const {
         host = forwardedHost->second;
     } else {
         const auto hostHeader = request.headers.find("Host");
-        if (hostHeader != request.headers.end() && !hostHeader->second.empty()) {
-            host = hostHeader->second;
-        }
+        if (hostHeader != request.headers.end() && !hostHeader->second.empty()) host = hostHeader->second;
     }
     if (host.empty()) {
         const std::string base = configuredPublicBaseUrl();
-        if (!base.empty()) {
-            host = base.substr(base.find("://") + 3);
-        }
+        if (!base.empty()) host = base.substr(base.find("://") + 3);
     }
-    if (host.empty()) {
-        return config_.redirectUri;
-    }
-
+    if (host.empty()) return config_.redirectUri;
     std::ostringstream out;
     out << "https://" << host << request.target;
     return out.str();
@@ -645,36 +595,22 @@ std::string AppServer::generateStateToken() const {
     std::ostringstream out;
     out << std::hex;
     for (int i = 0; i < 16; ++i) {
-        const unsigned int value = device();
-        out << std::setw(2) << std::setfill('0') << (value & 0xFFu);
+        out << std::setw(2) << std::setfill('0') << (device() & 0xFFu);
     }
-    out << std::dec;
     return out.str();
 }
 
 bool AppServer::apiAuthorized(const HttpRequest& request) const {
-    if (config_.apiToken.empty()) {
-        return false;
-    }
+    if (config_.apiToken.empty()) return false;
     const auto auth = request.headers.find("Authorization");
-    if (auth == request.headers.end()) {
-        return false;
-    }
+    if (auth == request.headers.end()) return false;
     const std::string prefix = "Bearer ";
-    if (auth->second.rfind(prefix, 0) != 0) {
-        return false;
-    }
-    const std::string token = auth->second.substr(prefix.size());
-    return constantTimeEquals(token, config_.apiToken);
+    if (auth->second.rfind(prefix, 0) != 0) return false;
+    return constantTimeEquals(auth->second.substr(prefix.size()), config_.apiToken);
 }
 
 AppServer::HttpResponse AppServer::redirectToHttps(const HttpRequest& request) const {
-    HttpResponse response;
-    response.status = 308;
-    response.contentType = "text/plain; charset=utf-8";
-    response.body = "redirecting to https";
-    response.headers.push_back({"Location", buildHttpsUrl(request)});
-    return response;
+    return {308, "text/plain; charset=utf-8", "redirecting to https", {{"Location", buildHttpsUrl(request)}}};
 }
 
 AppServer::HttpResponse AppServer::unauthorized(const std::string& message) const {
@@ -691,8 +627,6 @@ AppServer::HttpResponse AppServer::jsonResponse(int status, const std::string& b
 AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     const auto query = parseQuery(request.query);
 
-    // ---- utility lambdas (shared across route blocks) ----
-    // Extract path segment after a prefix, stopping at the next '/'
     auto pathParam = [&](const std::string& prefix) -> std::string {
         if (request.path.rfind(prefix, 0) == 0 && request.path.size() > prefix.size()) {
             std::string rest = request.path.substr(prefix.size());
@@ -701,13 +635,14 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
         }
         return "";
     };
-    // Return whatever follows /prefix/id/
     auto pathSuffix = [&](const std::string& prefix, const std::string& id) -> std::string {
         std::string full = prefix + id + "/";
         if (request.path.rfind(full, 0) == 0) return request.path.substr(full.size());
         return "";
     };
-    // Extract a string or number value from a flat JSON body
+    (void)pathParam;
+    (void)pathSuffix;
+
     auto jf = [&](const std::string& key) -> std::string {
         std::string pat = "\"" + key + "\"";
         auto p = request.body.find(pat);
@@ -726,25 +661,26 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
         return raw;
     };
     auto ji = [&](const std::string& key) -> int64_t {
-        std::string v = jf(key); return v.empty() ? 0 : std::strtoll(v.c_str(), nullptr, 10);
+        std::string v = jf(key);
+        return v.empty() ? 0 : std::strtoll(v.c_str(), nullptr, 10);
     };
 
     // ===========================================================
     // SYSTEM / AUTH ROUTES
     // ===========================================================
-    if (request.method == "GET" && request.path == "/health") {
+    if (request.method == "GET" && request.path == "/health")
         return {200, "text/plain; charset=utf-8", "ok", {}};
-    }
+
     if (request.method == "GET" && request.path == "/auth/url") {
         try {
-            const std::string aspsp = query.count("aspsp") ? query.at("aspsp") : config_.aspspName;
+            const std::string aspsp   = query.count("aspsp")   ? query.at("aspsp")   : config_.aspspName;
             const std::string country = query.count("country") ? query.at("country") : config_.aspspCountry;
-            const std::string state = generateStateToken();
+            const std::string state   = generateStateToken();
             const StartAuthResult authResult = client_.startAuthorization(state, aspsp, country);
             {
                 std::lock_guard<std::mutex> lock(stateMutex_);
                 expectedAuthState_ = state;
-                pendingAuthAspsp_ = aspsp;
+                pendingAuthAspsp_   = aspsp;
                 pendingAuthCountry_ = country;
             }
             return {200, "text/plain; charset=utf-8", authResult.url, {}};
@@ -754,16 +690,17 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             return {500, "text/plain; charset=utf-8", error.what(), {}};
         }
     }
+
     if (request.method == "GET" && request.path == "/start-auth") {
         try {
-            const std::string aspsp = query.count("aspsp") ? query.at("aspsp") : config_.aspspName;
+            const std::string aspsp   = query.count("aspsp")   ? query.at("aspsp")   : config_.aspspName;
             const std::string country = query.count("country") ? query.at("country") : config_.aspspCountry;
-            const std::string state = generateStateToken();
+            const std::string state   = generateStateToken();
             const StartAuthResult authResult = client_.startAuthorization(state, aspsp, country);
             {
                 std::lock_guard<std::mutex> lock(stateMutex_);
                 expectedAuthState_ = state;
-                pendingAuthAspsp_ = aspsp;
+                pendingAuthAspsp_   = aspsp;
                 pendingAuthCountry_ = country;
             }
             return {302, "text/plain; charset=utf-8", "redirecting", {{"Location", authResult.url}}};
@@ -773,15 +710,16 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             return {500, "text/plain; charset=utf-8", error.what(), {}};
         }
     }
+
     if (request.method == "GET" && request.path == "/oauth/callback") {
         if (query.count("error") != 0) {
-            const std::string errDesc = query.count("error_description") != 0 ? query.at("error_description") : "";
+            const std::string errDesc = query.count("error_description") ? query.at("error_description") : "";
             std::lock_guard<std::mutex> lock(stateMutex_);
             lastError_ = query.at("error") + (errDesc.empty() ? "" : ": " + errDesc);
             return {400, "text/plain; charset=utf-8", "OAuth error: " + lastError_, {}};
         }
-        const std::string code = query.count("code") != 0 ? query.at("code") : std::string();
-        const std::string state = query.count("state") != 0 ? query.at("state") : std::string();
+        const std::string code  = query.count("code")  ? query.at("code")  : std::string();
+        const std::string state = query.count("state") ? query.at("state") : std::string();
         {
             std::lock_guard<std::mutex> lock(stateMutex_);
             if (expectedAuthState_.empty() || !constantTimeEquals(expectedAuthState_, state)) {
@@ -798,30 +736,25 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                 {
                     std::lock_guard<std::mutex> lock(stateMutex_);
                     BankSession bs;
-                    bs.aspspName = pendingAuthAspsp_;
+                    bs.aspspName    = pendingAuthAspsp_;
                     bs.aspspCountry = pendingAuthCountry_;
-                    bs.sessionId = session.sessionId;
-                    bs.accountIds = session.accountIds;
-                    connectedBank = bs.aspspName;
+                    bs.sessionId    = session.sessionId;
+                    bs.accountIds   = session.accountIds;
+                    connectedBank   = bs.aspspName;
                     bool replaced = false;
                     for (auto& existing : bankSessions_) {
                         if (existing.aspspName == bs.aspspName && existing.aspspCountry == bs.aspspCountry) {
-                            existing = bs;
-                            replaced = true;
-                            break;
+                            existing = bs; replaced = true; break;
                         }
                     }
-                    if (!replaced) {
-                        bankSessions_.push_back(bs);
-                    }
+                    if (!replaced) bankSessions_.push_back(bs);
                     pendingAuthAspsp_.clear();
                     pendingAuthCountry_.clear();
                     lastError_.clear();
                 }
                 saveSessions();
-                try {
-                    syncOnce("auth-callback");
-                } catch (const std::exception& syncErr) {
+                try { syncOnce("auth-callback"); }
+                catch (const std::exception& syncErr) {
                     std::lock_guard<std::mutex> lock(stateMutex_);
                     lastError_ = std::string("sync after auth: ") + syncErr.what();
                 }
@@ -839,64 +772,59 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
         }
         return {200, "text/plain; charset=utf-8", "Authorization received (no code). You can close this tab.", {}};
     }
+
     if (request.method == "POST" && request.path == "/webhook") {
-        if (!webhookSecretValid(request)) {
+        if (!webhookSecretValid(request))
             return {401, "text/plain; charset=utf-8", "invalid webhook secret", {}};
-        }
-        if (!request.headers.count("Content-Type") || lowerCopy(request.headers.at("Content-Type")).find("application/json") == std::string::npos) {
+        if (!request.headers.count("Content-Type") ||
+            lowerCopy(request.headers.at("Content-Type")).find("application/json") == std::string::npos)
             return {415, "text/plain; charset=utf-8", "webhook requires application/json", {}};
-        }
         {
             std::lock_guard<std::mutex> lock(stateMutex_);
             lastWebhookPayload_ = request.body;
         }
-        try {
-            syncOnce("webhook");
-        } catch (const std::exception& error) {
+        try { syncOnce("webhook"); }
+        catch (const std::exception& error) {
             std::lock_guard<std::mutex> lock(stateMutex_);
             lastError_ = error.what();
         }
         return {200, "text/plain; charset=utf-8", "ok", {}};
     }
+
     if (request.method == "GET" && request.path == "/sync") {
-        if (!apiAuthorized(request)) {
+        if (!apiAuthorized(request))
             return unauthorized(config_.apiToken.empty() ? "API token not configured" : "Unauthorized");
-        }
-        try {
-            syncOnce("manual");
-            return jsonResponse(200, renderStatus());
-        } catch (const std::exception& error) {
+        try { syncOnce("manual"); return jsonResponse(200, renderStatus()); }
+        catch (const std::exception& error) {
             std::lock_guard<std::mutex> lock(stateMutex_);
             lastError_ = error.what();
             return jsonResponse(500, std::string("{\"error\":") + jsonString(error.what()) + "}");
         }
     }
-    if (request.method == "GET" && request.path == "/status") {
+
+    if (request.method == "GET" && request.path == "/status")
         return {200, "text/plain; charset=utf-8", renderStatus(), {}};
-    }
-    if (request.method == "GET" && request.path == "/") {
+
+    if (request.method == "GET" && request.path == "/")
         return {200, "text/html; charset=utf-8", renderHome(), {}};
-    }
 
     // ===========================================================
-    // LEGACY EB-ONLY ENDPOINTS (live Enable Banking data, no DB)
+    // LEGACY EB-ONLY ENDPOINTS
     // ===========================================================
     if (request.method == "GET" && request.path == "/api/status") {
-        if (!apiAuthorized(request)) {
+        if (!apiAuthorized(request))
             return unauthorized(config_.apiToken.empty() ? "API token not configured" : "Unauthorized");
-        }
         std::ostringstream out;
         {
             std::lock_guard<std::mutex> lock(stateMutex_);
             out << "{\"status\":" << jsonString("ok")
-                << ",\"accounts\":" << accounts_.size()
+                << ",\"accounts\":"    << accounts_.size()
                 << ",\"transactions\":" << transactions_.size()
-                << ",\"lastSync\":" << jsonString(lastSyncSummary_)
-                << ",\"lastError\":" << jsonString(lastError_) << "}";
+                << ",\"lastSync\":"    << jsonString(lastSyncSummary_)
+                << ",\"lastError\":"   << jsonString(lastError_) << "}";
         }
         return jsonResponse(200, out.str());
     }
-    // Legacy EB live endpoints (kept for backwards-compat)
     if (request.method == "GET" && request.path == "/api/eb/accounts") {
         if (!apiAuthorized(request)) return unauthorized("Unauthorized");
         return jsonResponse(200, renderAccountsJson());
@@ -911,16 +839,27 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     }
 
     // ===========================================================
-    // DATABASE-BACKED API  —  /api/* (canonical) + /api/db/* (alias)
-    //
-    // Both prefixes are supported. Strip /api/db/ to /api/ so a
-    // single implementation handles both.
+    // DATABASE-BACKED API — /api/* (canonical) + /api/db/* (alias)
+    // Normalize: rewrite /api/db/... -> /api/... for single implementation
     // ===========================================================
-    // Normalize: rewrite /api/db/... -> /api/... for routing below
     std::string normPath = request.path;
-    if (normPath.rfind("/api/db/", 0) == 0) {
-        normPath = "/api/" + normPath.substr(8); // len("/api/db/") == 8
-    }
+    if (normPath.rfind("/api/db/", 0) == 0)
+        normPath = "/api/" + normPath.substr(8);
+
+    // lambdas operating on normPath
+    auto normPathParam = [&](const std::string& prefix) -> std::string {
+        if (normPath.rfind(prefix, 0) == 0 && normPath.size() > prefix.size()) {
+            std::string rest = normPath.substr(prefix.size());
+            auto slash = rest.find('/');
+            return slash == std::string::npos ? rest : rest.substr(0, slash);
+        }
+        return "";
+    };
+    auto normPathSuffix = [&](const std::string& prefix, const std::string& id) -> std::string {
+        std::string full = prefix + id + "/";
+        if (normPath.rfind(full, 0) == 0) return normPath.substr(full.size());
+        return "";
+    };
 
     // ---- ACCOUNTS ----
     if (normPath == "/api/accounts") {
@@ -931,13 +870,13 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             for (size_t i = 0; i < accs.size(); ++i) {
                 if (i) o << ",";
                 auto& a = accs[i];
-                o << "{\"id\":" << jsonString(a.id)
-                  << ",\"name\":" << jsonString(a.name)
-                  << ",\"type\":" << jsonString(a.type)
+                o << "{\"id\":"        << jsonString(a.id)
+                  << ",\"name\":"      << jsonString(a.name)
+                  << ",\"type\":"      << jsonString(a.type)
                   << ",\"currency\":" << jsonString(a.currency)
                   << ",\"bank_name\":" << jsonString(a.bankName)
-                  << ",\"iban\":" << jsonString(a.iban)
-                  << ",\"balance\":" << a.balance
+                  << ",\"iban\":"      << jsonString(a.iban)
+                  << ",\"balance\":"   << a.balance
                   << ",\"created_at\":" << jsonString(a.createdAt)
                   << ",\"updated_at\":" << jsonString(a.updatedAt) << "}";
             }
@@ -946,42 +885,27 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
         }
         if (request.method == "POST") {
             db::Account a;
-            a.id = db_->uuid();
-            a.name = jf("name");
-            a.type = jf("type"); if (a.type.empty()) a.type = "wallet";
+            a.id       = db_->uuid();
+            a.name     = jf("name");
+            a.type     = jf("type");     if (a.type.empty())     a.type     = "wallet";
             a.currency = jf("currency"); if (a.currency.empty()) a.currency = "PLN";
-            a.balance = ji("balance");
+            a.balance  = ji("balance");
             a.bankName = jf("bank_name");
-            a.iban = jf("iban");
+            a.iban     = jf("iban");
             db_->upsertAccount(a);
             return jsonResponse(201, "{\"id\":" + jsonString(a.id) + "}");
         }
     }
-    {
-        // /api/accounts/{id}  or  /api/db/accounts/{id}
-        // Use normPath for prefix matching
-        auto normPathParam = [&](const std::string& prefix) -> std::string {
-            if (normPath.rfind(prefix, 0) == 0 && normPath.size() > prefix.size()) {
-                std::string rest = normPath.substr(prefix.size());
-                auto slash = rest.find('/');
-                return slash == std::string::npos ? rest : rest.substr(0, slash);
-            }
-            return "";
-        };
-        auto normPathSuffix = [&](const std::string& prefix, const std::string& id) -> std::string {
-            std::string full = prefix + id + "/";
-            if (normPath.rfind(full, 0) == 0) return normPath.substr(full.size());
-            return "";
-        };
 
+    {
         std::string aid = normPathParam("/api/accounts/");
         if (!aid.empty()) {
             if (!apiAuthorized(request)) return unauthorized("Unauthorized");
             if (request.method == "PUT") {
                 db::Account a; a.id = aid;
-                a.name = jf("name"); a.type = jf("type");
-                a.currency = jf("currency"); a.balance = ji("balance");
-                a.bankName = jf("bank_name"); a.iban = jf("iban");
+                a.name     = jf("name");     a.type     = jf("type");
+                a.currency = jf("currency"); a.balance  = ji("balance");
+                a.bankName = jf("bank_name"); a.iban    = jf("iban");
                 db_->upsertAccount(a);
                 return jsonResponse(200, "{\"ok\":true}");
             }
@@ -996,30 +920,30 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             if (!apiAuthorized(request)) return unauthorized("Unauthorized");
             if (request.method == "GET") {
                 std::string acct = query.count("account_id") ? query.at("account_id") : "";
-                std::string from = query.count("from") ? query.at("from") : "";
-                std::string to   = query.count("to")   ? query.at("to")   : "";
+                std::string from = query.count("from")       ? query.at("from")       : "";
+                std::string to   = query.count("to")         ? query.at("to")         : "";
                 auto txs = db_->transactions(acct, from, to);
                 std::ostringstream o; o << "[";
                 for (size_t i = 0; i < txs.size(); ++i) {
                     if (i) o << ",";
-                    auto& t = txs[i];
+                    auto& t    = txs[i];
                     auto subs  = db_->subTx(t.id);
                     auto edits = db_->txHistory(t.id);
-                    o << "{\"id\":"        << jsonString(t.id)
-                      << ",\"account_id\":" << jsonString(t.accountId)
-                      << ",\"name\":"       << jsonString(t.name)
+                    o << "{\"id\":"          << jsonString(t.id)
+                      << ",\"account_id\":"  << jsonString(t.accountId)
+                      << ",\"name\":"        << jsonString(t.name)
                       << ",\"description\":" << jsonString(t.description)
-                      << ",\"amount\":"     << t.amount
-                      << ",\"currency\":"   << jsonString(t.currency)
-                      << ",\"from\":"       << jsonString(t.fromParty)
-                      << ",\"to\":"         << jsonString(t.toParty)
-                      << ",\"type\":"       << jsonString(t.type)
-                      << ",\"category\":"   << jsonString(t.category)
-                      << ",\"tag\":"        << jsonString(t.tag)
-                      << ",\"date\":"       << jsonString(t.date)
-                      << ",\"source\":"     << jsonString(t.source)
-                      << ",\"edited\":"     << (edits.empty() ? "false" : "true")
-                      << ",\"edit_count\":" << edits.size()
+                      << ",\"amount\":"      << t.amount
+                      << ",\"currency\":"    << jsonString(t.currency)
+                      << ",\"from\":"        << jsonString(t.fromParty)
+                      << ",\"to\":"          << jsonString(t.toParty)
+                      << ",\"type\":"        << jsonString(t.type)
+                      << ",\"category\":"    << jsonString(t.category)
+                      << ",\"tag\":"         << jsonString(t.tag)
+                      << ",\"date\":"        << jsonString(t.date)
+                      << ",\"source\":"      << jsonString(t.source)
+                      << ",\"edited\":"      << (edits.empty() ? "false" : "true")
+                      << ",\"edit_count\":"  << edits.size()
                       << ",\"splits\":[";
                     for (size_t j = 0; j < subs.size(); ++j) {
                         if (j) o << ",";
@@ -1035,16 +959,19 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             }
             if (request.method == "POST") {
                 db::Transaction t;
-                t.id = db_->uuid(); t.accountId = jf("account_id");
-                t.name = jf("name"); t.description = jf("description");
-                t.amount = ji("amount");
-                t.currency = jf("currency"); if (t.currency.empty()) t.currency = "PLN";
-                t.fromParty = jf("from"); t.toParty = jf("to");
-                t.type = jf("type"); if (t.type.empty()) t.type = "expense";
-                t.category = jf("category"); if (t.category.empty()) t.category = "other";
-                t.tag = jf("tag"); if (t.tag.empty()) t.tag = "opt";
-                t.date = jf("date"); if (t.date.empty()) t.date = db::Database::now().substr(0, 10);
-                t.source = "manual";
+                t.id          = db_->uuid();
+                t.accountId   = jf("account_id");
+                t.name        = jf("name");
+                t.description = jf("description");
+                t.amount      = ji("amount");
+                t.currency    = jf("currency"); if (t.currency.empty()) t.currency = "PLN";
+                t.fromParty   = jf("from");
+                t.toParty     = jf("to");
+                t.type        = jf("type");     if (t.type.empty())     t.type     = "expense";
+                t.category    = jf("category"); if (t.category.empty()) t.category = "other";
+                t.tag         = jf("tag");       if (t.tag.empty())      t.tag      = "opt";
+                t.date        = jf("date");      if (t.date.empty())     t.date     = db::Database::now().substr(0, 10);
+                t.source      = "manual";
                 db_->insertTx(t);
                 return jsonResponse(201, "{\"id\":" + jsonString(t.id) + "}");
             }
@@ -1086,12 +1013,17 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                         auto ve = obj.find_first_of(",}\"", vs);
                         return obj.substr(vs, ve - vs);
                     };
-                    db::Transaction p; p.accountId = parent.accountId;
-                    p.name = of("name"); p.category = of("category");
+                    db::Transaction p;
+                    p.accountId = parent.accountId;
+                    p.name      = of("name");
+                    p.category  = of("category");
                     std::string amt = of("amount");
-                    p.amount = amt.empty() ? 0 : std::strtoll(amt.c_str(), nullptr, 10);
-                    p.currency = parent.currency; p.date = parent.date;
-                    p.type = parent.type; p.source = parent.source; p.tag = parent.tag;
+                    p.amount    = amt.empty() ? 0 : std::strtoll(amt.c_str(), nullptr, 10);
+                    p.currency  = parent.currency;
+                    p.date      = parent.date;
+                    p.type      = parent.type;
+                    p.source    = parent.source;
+                    p.tag       = parent.tag;
                     parts.push_back(p);
                     pos = end;
                 }
@@ -1126,11 +1058,12 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                 std::ostringstream o; o << "[";
                 for (size_t i = 0; i < cats.size(); ++i) {
                     if (i) o << ",";
-                    o << "{\"name\":" << jsonString(cats[i].name)
-                      << ",\"icon\":" << jsonString(cats[i].icon)
+                    o << "{\"name\":"  << jsonString(cats[i].name)
+                      << ",\"icon\":"  << jsonString(cats[i].icon)
                       << ",\"color\":" << jsonString(cats[i].color) << "}";
                 }
-                o << "]"; return jsonResponse(200, o.str());
+                o << "]";
+                return jsonResponse(200, o.str());
             }
             if (request.method == "POST") {
                 db::Category c; c.name = jf("name"); c.icon = jf("icon"); c.color = jf("color");
@@ -1148,14 +1081,16 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                 std::ostringstream o; o << "[";
                 for (size_t i = 0; i < bs.size(); ++i) {
                     if (i) o << ",";
-                    o << "{\"category\":" << jsonString(bs[i].category)
-                      << ",\"planned\":" << bs[i].planned
+                    o << "{\"category\":"  << jsonString(bs[i].category)
+                      << ",\"planned\":"   << bs[i].planned
                       << ",\"year_month\":" << jsonString(bs[i].yearMonth) << "}";
                 }
-                o << "]"; return jsonResponse(200, o.str());
+                o << "]";
+                return jsonResponse(200, o.str());
             }
             if (request.method == "POST") {
-                db::Budget b; b.yearMonth = jf("year_month"); b.category = jf("category"); b.planned = ji("planned");
+                db::Budget b;
+                b.yearMonth = jf("year_month"); b.category = jf("category"); b.planned = ji("planned");
                 db_->upsertBudget(b);
                 return jsonResponse(201, "{\"ok\":true}");
             }
@@ -1168,10 +1103,11 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             for (size_t i = 0; i < lines.size(); ++i) {
                 if (i) o << ",";
                 o << "{\"category\":" << jsonString(lines[i].category)
-                  << ",\"planned\":" << lines[i].planned
-                  << ",\"actual\":" << lines[i].actual << "}";
+                  << ",\"planned\":"  << lines[i].planned
+                  << ",\"actual\":"   << lines[i].actual << "}";
             }
-            o << "]"; return jsonResponse(200, o.str());
+            o << "]";
+            return jsonResponse(200, o.str());
         }
 
         // ---- TODOS ----
@@ -1189,11 +1125,15 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                       << ",\"due_date\":"    << jsonString(ts[i].dueDate)
                       << ",\"done\":"        << (ts[i].done ? "true" : "false") << "}";
                 }
-                o << "]"; return jsonResponse(200, o.str());
+                o << "]";
+                return jsonResponse(200, o.str());
             }
             if (request.method == "POST") {
-                db::Todo t; t.name = jf("name"); t.description = jf("description");
-                t.amount = ji("amount"); t.dueDate = jf("due_date");
+                db::Todo t;
+                t.name        = jf("name");
+                t.description = jf("description");
+                t.amount      = ji("amount");
+                t.dueDate     = jf("due_date");
                 auto id = db_->insertTodo(t);
                 return jsonResponse(201, "{\"id\":" + std::to_string(id) + "}");
             }
@@ -1204,9 +1144,12 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                 if (!apiAuthorized(request)) return unauthorized("Unauthorized");
                 int64_t id = std::strtoll(todoid.c_str(), nullptr, 10);
                 if (request.method == "PUT") {
-                    db::Todo t; t.name = jf("name"); t.description = jf("description");
-                    t.amount = ji("amount"); t.dueDate = jf("due_date");
-                    t.done = jf("done") == "true" || jf("done") == "1";
+                    db::Todo t;
+                    t.name        = jf("name");
+                    t.description = jf("description");
+                    t.amount      = ji("amount");
+                    t.dueDate     = jf("due_date");
+                    t.done        = jf("done") == "true" || jf("done") == "1";
                     db_->updateTodo(id, t);
                     return jsonResponse(200, "{\"ok\":true}");
                 }
@@ -1234,15 +1177,19 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                     for (size_t j = 0; j < entries.size(); ++j) {
                         if (j) o << ",";
                         o << "{\"year_month\":" << jsonString(entries[j].yearMonth)
-                          << ",\"planned\":"`" << entries[j].planned
-                          << ",\"actual\":"    << entries[j].actual << "}";
+                          << ",\"planned\":"    << entries[j].planned
+                          << ",\"actual\":"     << entries[j].actual << "}";
                     }
                     o << "]}";
                 }
-                o << "]"; return jsonResponse(200, o.str());
+                o << "]";
+                return jsonResponse(200, o.str());
             }
             if (request.method == "POST") {
-                db::SavingsGoal g; g.name = jf("name"); g.target = ji("target"); g.deadline = jf("deadline");
+                db::SavingsGoal g;
+                g.name     = jf("name");
+                g.target   = ji("target");
+                g.deadline = jf("deadline");
                 auto id = db_->insertGoal(g);
                 return jsonResponse(201, "{\"id\":" + std::to_string(id) + "}");
             }
@@ -1254,12 +1201,14 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                 int64_t id = std::strtoll(sid.c_str(), nullptr, 10);
                 std::string suffix = normPathSuffix("/api/savings/", sid);
                 if (suffix == "entry" && request.method == "PUT") {
-                    db::SavingsEntry e; e.goalId = id;
-                    e.yearMonth = jf("year_month"); e.planned = ji("planned"); e.actual = ji("actual");
+                    db::SavingsEntry e;
+                    e.goalId    = id;
+                    e.yearMonth = jf("year_month");
+                    e.planned   = ji("planned");
+                    e.actual    = ji("actual");
                     db_->upsertEntry(e);
                     return jsonResponse(200, "{\"ok\":true}");
                 }
-                // GET /api/savings/{id}/chart — monthly planned vs actual series
                 if (suffix == "chart" && request.method == "GET") {
                     auto entries = db_->savingsEntries(id);
                     std::ostringstream o;
@@ -1268,9 +1217,10 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                         if (j) o << ",";
                         o << "{\"year_month\":" << jsonString(entries[j].yearMonth)
                           << ",\"planned\":"    << entries[j].planned
-                          << ",\"actual\":"      << entries[j].actual << "}";
+                          << ",\"actual\":"     << entries[j].actual << "}";
                     }
-                    o << "]}"; return jsonResponse(200, o.str());
+                    o << "]}";
+                    return jsonResponse(200, o.str());
                 }
                 if (request.method == "DELETE") {
                     db_->deleteGoal(id);
@@ -1286,18 +1236,21 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             std::ostringstream o; o << "[";
             for (size_t i = 0; i < recs.size(); ++i) {
                 if (i) o << ",";
-                o << "{\"id\":"          << recs[i].id
-                  << ",\"synced_at\":"   << jsonString(recs[i].syncedAt)
-                  << ",\"bank_name\":"   << jsonString(recs[i].bankName)
+                o << "{\"id\":"           << recs[i].id
+                  << ",\"synced_at\":"    << jsonString(recs[i].syncedAt)
+                  << ",\"bank_name\":"    << jsonString(recs[i].bankName)
                   << ",\"new_tx_count\":" << recs[i].newTx
-                  << ",\"details\":"     << jsonString(recs[i].details) << "}";
+                  << ",\"details\":"      << jsonString(recs[i].details) << "}";
             }
-            o << "]"; return jsonResponse(200, o.str());
+            o << "]";
+            return jsonResponse(200, o.str());
         }
         if (normPath == "/api/sync/now" && request.method == "POST") {
             if (!apiAuthorized(request)) return unauthorized("Unauthorized");
             try { syncOnce("api-trigger"); return jsonResponse(200, "{\"ok\":true}"); }
-            catch (const std::exception& e) { return jsonResponse(500, "{\"error\":" + jsonString(e.what()) + "}"); }
+            catch (const std::exception& e) {
+                return jsonResponse(500, "{\"error\":" + jsonString(e.what()) + "}");
+            }
         }
 
         // ---- STATS ----
@@ -1313,9 +1266,10 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                   << ",\"year_month\":" << jsonString(rows[i].yearMonth)
                   << ",\"total\":"      << rows[i].total << "}";
             }
-            o << "]"; return jsonResponse(200, o.str());
+            o << "]";
+            return jsonResponse(200, o.str());
         }
-    } // end normPathParam scope
+    }
 
     return {404, "text/plain; charset=utf-8", "not found", {}};
 }
@@ -1330,11 +1284,11 @@ std::string AppServer::renderStatus() const {
         out << "bank[" << i << "]=" << s.aspspName << " (" << s.aspspCountry << ")"
             << " session=" << s.sessionId << " accounts=" << s.accountIds.size() << "\n";
     }
-    out << "total_accounts=" << accounts_.size() << "\n";
+    out << "total_accounts="     << accounts_.size()     << "\n";
     out << "total_transactions=" << transactions_.size() << "\n";
-    out << "auth_pending=" << (!expectedAuthState_.empty() ? "yes" : "no") << "\n";
-    out << "last_sync=" << (lastSyncSummary_.empty() ? "<none>" : lastSyncSummary_) << "\n";
-    out << "last_error=" << (lastError_.empty() ? "<none>" : lastError_) << "\n";
+    out << "auth_pending="  << (!expectedAuthState_.empty() ? "yes" : "no") << "\n";
+    out << "last_sync="  << (lastSyncSummary_.empty() ? "<none>" : lastSyncSummary_) << "\n";
+    out << "last_error=" << (lastError_.empty()       ? "<none>" : lastError_)       << "\n";
     return out.str();
 }
 
@@ -1342,16 +1296,14 @@ std::string AppServer::renderHome() const {
     std::ostringstream out;
     out << "<html><body>";
     out << "<h1>BanksConnectApp</h1>";
-    out << "<h3>Connect a bank:</h3>";
-    out << "<ul>";
+    out << "<h3>Connect a bank:</h3><ul>";
     out << "<li><a href=\"/start-auth?aspsp=Bank%20Millennium&country=PL\">Bank Millennium</a></li>";
     out << "<li><a href=\"/start-auth?aspsp=PKO&country=PL\">PKO BP</a></li>";
     out << "<li><a href=\"/start-auth?aspsp=mBank&country=PL\">mBank</a></li>";
     out << "<li><a href=\"/start-auth?aspsp=ING&country=PL\">ING</a></li>";
     out << "<li><a href=\"/start-auth?aspsp=Santander&country=PL\">Santander</a></li>";
     out << "</ul>";
-    out << "<h3>Status:</h3>";
-    out << "<pre>" << htmlEscape(renderStatus()) << "</pre>";
+    out << "<h3>Status:</h3><pre>" << htmlEscape(renderStatus()) << "</pre>";
     out << "<p><a href=\"/health\">/health</a> | <a href=\"/status\">/status</a></p>";
     out << "</body></html>";
     return out.str();
@@ -1362,15 +1314,11 @@ std::string AppServer::renderAccountsJson() const {
     std::ostringstream out;
     out << "{\"accounts\":[";
     for (std::size_t i = 0; i < accounts_.size(); ++i) {
+        if (i) out << ",";
         const acc& account = accounts_[i];
-        out << "{";
-        out << "\"name\":" << jsonString(account.getName()) << ",";
-        out << "\"balance\":" << account.getBalance() << ",";
-        out << "\"transactions\":" << account.getTransactions().size();
-        out << "}";
-        if (i + 1 < accounts_.size()) {
-            out << ",";
-        }
+        out << "{\"name\":"    << jsonString(account.getName())
+            << ",\"balance\":" << account.getBalance()
+            << ",\"transactions\":" << account.getTransactions().size() << "}";
     }
     out << "]}";
     return out.str();
@@ -1381,23 +1329,19 @@ std::string AppServer::renderTransactionsJson() const {
     std::ostringstream out;
     out << "{\"transactions\":[";
     for (std::size_t i = 0; i < transactions_.size(); ++i) {
-        const trans& transaction = transactions_[i];
-        out << "{";
-        out << "\"name\":" << jsonString(transaction.name) << ",";
-        out << "\"description\":" << jsonString(transaction.opis) << ",";
-        out << "\"amount\":" << transaction.amount << ",";
-        out << "\"currency\":" << jsonString(enumToString(transaction.curr)) << ",";
-        out << "\"from\":" << jsonString(transaction.from) << ",";
-        out << "\"to\":" << jsonString(transaction.to) << ",";
-        out << "\"type\":" << jsonString(enumToString(transaction.type)) << ",";
-        out << "\"category\":" << jsonString("other") << ",";
-        out << "\"date\":" << jsonString(transaction.date) << ",";
-        out << "\"tag\":" << jsonString(enumToString(transaction.tag)) << ",";
-        out << "\"subtransactions\":" << transaction.subtransactions.size();
-        out << "}";
-        if (i + 1 < transactions_.size()) {
-            out << ",";
-        }
+        if (i) out << ",";
+        const trans& t = transactions_[i];
+        out << "{\"name\":"        << jsonString(t.name)
+            << ",\"description\":" << jsonString(t.opis)
+            << ",\"amount\":"      << t.amount
+            << ",\"currency\":"    << jsonString(enumToString(t.curr))
+            << ",\"from\":"        << jsonString(t.from)
+            << ",\"to\":"          << jsonString(t.to)
+            << ",\"type\":"        << jsonString(enumToString(t.type))
+            << ",\"category\":"    << jsonString("other")
+            << ",\"date\":"        << jsonString(t.date)
+            << ",\"tag\":"         << jsonString(enumToString(t.tag))
+            << ",\"subtransactions\":" << t.subtransactions.size() << "}";
     }
     out << "]}";
     return out.str();
@@ -1417,25 +1361,21 @@ std::string AppServer::buildResponse(const HttpResponse& response) {
         case 404: out << "Not Found"; break;
         case 415: out << "Unsupported Media Type"; break;
         case 500: out << "Internal Server Error"; break;
-        default: out << "OK"; break;
+        default:  out << "OK"; break;
     }
     out << "\r\n";
-    out << "Content-Type: " << response.contentType << "\r\n";
-    out << "Content-Length: " << response.body.size() << "\r\n";
+    out << "Content-Type: "   << response.contentType      << "\r\n";
+    out << "Content-Length: " << response.body.size()       << "\r\n";
     out << "Connection: close\r\n";
     out << "Cache-Control: no-store\r\n";
-    for (const auto& header : response.headers) {
+    for (const auto& header : response.headers)
         out << header.first << ": " << header.second << "\r\n";
-    }
-    out << "\r\n";
-    out << response.body;
+    out << "\r\n" << response.body;
     return out.str();
 }
 
 bool AppServer::webhookSecretValid(const HttpRequest& request) const {
-    if (config_.webhookSecret.empty()) {
-        return false;
-    }
+    if (config_.webhookSecret.empty()) return false;
     const std::string headerName = config_.webhookSecretHeader.empty() ? "X-Webhook-Secret" : config_.webhookSecretHeader;
     const auto it = request.headers.find(headerName);
     return it != request.headers.end() && constantTimeEquals(it->second, config_.webhookSecret);
