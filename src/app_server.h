@@ -44,6 +44,11 @@ private:
     std::atomic<bool> running_;
     std::thread syncThread_;
     mutable std::mutex stateMutex_;
+
+    // Per-connection threads — reaped lazily in serve()
+    std::mutex threadsMutex_;
+    std::vector<std::thread> clientThreads_;
+
     std::vector<acc> accounts_;
     std::vector<trans> transactions_;
     std::string expectedAuthState_;
@@ -52,7 +57,6 @@ private:
     std::string lastSyncSummary_;
     std::string lastError_;
 
-    // Enable Banking session state — supports multiple banks
     struct BankSession {
         std::string aspspName;
         std::string aspspCountry;
@@ -61,14 +65,16 @@ private:
         std::vector<std::string> accountIds;
     };
     std::vector<BankSession> bankSessions_;
-    std::string pendingAuthAspsp_;    // ASPSP name for the auth flow in progress
-    std::string pendingAuthCountry_;  // country for the auth flow in progress
+    std::string pendingAuthAspsp_;
+    std::string pendingAuthCountry_;
 
     void startSyncLoop();
     void syncOnce(const std::string& reason);
     void saveSessions() const;
     void loadSessions();
     void serve(int port);
+    void handleClient(int clientFd);
+    void reapFinishedThreads();
     HttpResponse handleRequest(const HttpRequest& request);
     HttpResponse redirectToHttps(const HttpRequest& request) const;
     HttpResponse unauthorized(const std::string& message) const;

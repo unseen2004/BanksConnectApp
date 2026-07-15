@@ -46,6 +46,27 @@ AppServer::~AppServer() {
     if (syncThread_.joinable()) {
         syncThread_.join();
     }
+    // join all remaining client threads
+    std::lock_guard<std::mutex> lk(threadsMutex_);
+    for (auto& t : clientThreads_) {
+        if (t.joinable()) t.join();
+    }
+}
+
+void AppServer::reapFinishedThreads() {
+    std::lock_guard<std::mutex> lk(threadsMutex_);
+    clientThreads_.erase(
+        std::remove_if(clientThreads_.begin(), clientThreads_.end(),
+            [](std::thread& t) {
+                if (t.joinable()) {
+                    // try_join not in std; detach finished threads
+                    // We use a simple approach: always detach on erase
+                    t.detach();
+                    return true;
+                }
+                return false;
+            }),
+        clientThreads_.end());
 }
 
 void AppServer::run() {
@@ -121,7 +142,7 @@ void AppServer::syncOnce(const std::string& reason) {
     if (!ids.empty()) {
         for (const std::string& accountId : ids) {
             const ::HttpResponse balResp = client_.getAccountBalances(accountId);
-            const ::HttpResponse txResp = client_.getAccountTransactions(accountId);
+            const ::HttpResponse txResp  = client_.getAccountTransactions(accountId);
 
             summary << " account=" << accountId
                     << " bal_status=" << balResp.statusCode
@@ -154,11 +175,11 @@ void AppServer::syncOnce(const std::string& reason) {
             }
         }
     } else {
-        const ::HttpResponse accountsResponse = client_.getAccounts();
-        const ::HttpResponse balancesResponse = client_.getBalances();
+        const ::HttpResponse accountsResponse     = client_.getAccounts();
+        const ::HttpResponse balancesResponse     = client_.getBalances();
         const ::HttpResponse transactionsResponse = client_.getTransactions();
 
-        accounts = parseAccounts(accountsResponse.body);
+        accounts     = parseAccounts(accountsResponse.body);
         transactions = parseTransactions(transactionsResponse.body);
 
         if (!accounts.empty()) {
@@ -178,11 +199,11 @@ void AppServer::syncOnce(const std::string& reason) {
     if (db_) {
         for (const auto& a : accounts) {
             db::Account dba;
-            dba.id = "bank_acc_" + a.getName();
-            dba.name = a.getName();
-            dba.type = "bank";
+            dba.id       = "bank_acc_" + a.getName();
+            dba.name     = a.getName();
+            dba.type     = "bank";
             dba.currency = "PLN";
-            dba.balance = a.getBalance() * 100;
+            dba.balance  = a.getBalance() * 100;
             db_->upsertAccount(dba);
         }
         int newTxCount = 0;
@@ -190,19 +211,19 @@ void AppServer::syncOnce(const std::string& reason) {
             std::string bankTxId = t.name + "_" + t.date;
             if (!db_->txExists(bankTxId)) {
                 db::Transaction dbt;
-                dbt.id = db_->uuid();
+                dbt.id        = db_->uuid();
                 dbt.accountId = "bank_acc_" + (accounts.empty() ? "unknown" : accounts.front().getName());
-                dbt.name = t.name;
+                dbt.name        = t.name;
                 dbt.description = t.opis;
-                dbt.amount = t.amount * 100;
-                dbt.currency = "PLN";
-                dbt.fromParty = t.from;
-                dbt.toParty = t.to;
-                dbt.type = t.amount < 0 ? "expense" : "income";
-                dbt.category = "other";
-                dbt.date = t.date;
-                dbt.source = "bank";
-                dbt.bankTxId = bankTxId;
+                dbt.amount      = t.amount * 100;
+                dbt.currency    = "PLN";
+                dbt.fromParty   = t.from;
+                dbt.toParty     = t.to;
+                dbt.type        = t.amount < 0 ? "expense" : "income";
+                dbt.category    = "other";
+                dbt.date        = t.date;
+                dbt.source      = "bank";
+                dbt.bankTxId    = bankTxId;
                 db_->insertTx(dbt);
                 newTxCount++;
             }
@@ -210,14 +231,14 @@ void AppServer::syncOnce(const std::string& reason) {
         db::SyncRec rec;
         rec.syncedAt = db::Database::now();
         rec.bankName = "All Banks Sync";
-        rec.newTx = newTxCount;
-        rec.details = summary.str();
+        rec.newTx    = newTxCount;
+        rec.details  = summary.str();
         db_->recordSync(rec);
     }
 
     std::lock_guard<std::mutex> lock(stateMutex_);
-    accounts_ = std::move(accounts);
-    transactions_ = std::move(transactions);
+    accounts_        = std::move(accounts);
+    transactions_    = std::move(transactions);
     lastSyncSummary_ = summary.str();
     lastError_.clear();
 }
@@ -234,9 +255,9 @@ void AppServer::saveSessions() const {
         for (std::size_t i = 0; i < bankSessions_.size(); ++i) {
             const auto& s = bankSessions_[i];
             if (i > 0) out << ",";
-            out << "{\"aspsp_name\":" << jsonString(s.aspspName)
-                << ",\"aspsp_country\":" << jsonString(s.aspspCountry)
-                << ",\"session_id\":" << jsonString(s.sessionId)
+            out << "{\"aspsp_name\":"       << jsonString(s.aspspName)
+                << ",\"aspsp_country\":"    << jsonString(s.aspspCountry)
+                << ",\"session_id\":"       << jsonString(s.sessionId)
                 << ",\"authorization_id\":" << jsonString(s.authorizationId)
                 << ",\"account_ids\":[";
             for (std::size_t j = 0; j < s.accountIds.size(); ++j) {
@@ -295,20 +316,20 @@ void AppServer::loadSessions() {
             return content.substr(qs + 1, qe - qs - 1);
         };
 
-        std::size_t objEnd = content.find(']', pos);
+        std::size_t objEnd  = content.find(']', pos);
         if (objEnd == std::string::npos) objEnd = content.size();
         std::size_t nextObj = content.find("\"aspsp_name\"", pos + 1);
         std::size_t searchEnd = (nextObj != std::string::npos && nextObj < objEnd) ? nextObj : objEnd;
         (void)searchEnd;
 
-        bs.aspspName    = extractStr("aspsp_name",    pos);
-        bs.aspspCountry = extractStr("aspsp_country", pos);
-        bs.sessionId    = extractStr("session_id",    pos);
+        bs.aspspName       = extractStr("aspsp_name",       pos);
+        bs.aspspCountry    = extractStr("aspsp_country",    pos);
+        bs.sessionId       = extractStr("session_id",       pos);
         bs.authorizationId = extractStr("authorization_id", pos);
 
         std::size_t arrStart = content.find("\"account_ids\"", pos);
         if (arrStart != std::string::npos && arrStart < objEnd) {
-            std::size_t bracket = content.find('[', arrStart);
+            std::size_t bracket    = content.find('[', arrStart);
             std::size_t bracketEnd = content.find(']', bracket);
             if (bracket != std::string::npos && bracketEnd != std::string::npos) {
                 std::string arr = content.substr(bracket + 1, bracketEnd - bracket - 1);
@@ -336,6 +357,9 @@ void AppServer::loadSessions() {
     std::cout << "[EB] Loaded " << bankSessions_.size() << " saved sessions" << std::endl;
 }
 
+// ------------------------------------------------------------------
+// Multi-threaded server: each accepted connection gets its own thread
+// ------------------------------------------------------------------
 void AppServer::serve(int port) {
     const int serverFd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (serverFd < 0) {
@@ -346,15 +370,15 @@ void AppServer::serve(int port) {
     ::setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
 
     sockaddr_in address{};
-    address.sin_family = AF_INET;
+    address.sin_family      = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_ANY);
-    address.sin_port = htons(static_cast<uint16_t>(port));
+    address.sin_port        = htons(static_cast<uint16_t>(port));
 
     if (::bind(serverFd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
         ::close(serverFd);
         throw std::runtime_error(std::string("bind failed: ") + std::strerror(errno));
     }
-    if (::listen(serverFd, 16) < 0) {
+    if (::listen(serverFd, 128) < 0) {
         ::close(serverFd);
         throw std::runtime_error(std::string("listen failed: ") + std::strerror(errno));
     }
@@ -365,21 +389,37 @@ void AppServer::serve(int port) {
             if (errno == EINTR) continue;
             break;
         }
-
-        const std::string rawRequest = readRequest(clientFd);
-        const HttpRequest request = parseRequest(rawRequest);
-        HttpResponse response;
-        if (config_.enforceHttps && !requestIsSecure(request) && !config_.allowInsecureHttp) {
-            response = redirectToHttps(request);
-        } else {
-            response = handleRequest(request);
+        // Spawn a thread per connection; reap old finished ones every 64 connections
+        {
+            std::lock_guard<std::mutex> lk(threadsMutex_);
+            clientThreads_.emplace_back([this, clientFd]() {
+                handleClient(clientFd);
+            });
+            if (clientThreads_.size() > 64) {
+                // Detach all threads — they manage their own lifetime
+                for (auto& t : clientThreads_) {
+                    if (t.joinable()) t.detach();
+                }
+                clientThreads_.clear();
+            }
         }
-        const std::string rawResponse = buildResponse(response);
-        ::send(clientFd, rawResponse.data(), rawResponse.size(), 0);
-        ::close(clientFd);
     }
 
     ::close(serverFd);
+}
+
+void AppServer::handleClient(int clientFd) {
+    const std::string rawRequest = readRequest(clientFd);
+    const HttpRequest  request   = parseRequest(rawRequest);
+    HttpResponse response;
+    if (config_.enforceHttps && !requestIsSecure(request) && !config_.allowInsecureHttp) {
+        response = redirectToHttps(request);
+    } else {
+        response = handleRequest(request);
+    }
+    const std::string rawResponse = buildResponse(response);
+    ::send(clientFd, rawResponse.data(), rawResponse.size(), 0);
+    ::close(clientFd);
 }
 
 std::string AppServer::readRequest(int clientFd) {
@@ -403,13 +443,14 @@ std::string AppServer::readRequest(int clientFd) {
             const std::size_t contentLengthPos = headers.find("Content-Length:");
             if (contentLengthPos != std::string::npos) {
                 const std::size_t valueStart = contentLengthPos + std::strlen("Content-Length:");
-                const std::size_t valueEnd = headers.find("\r\n", valueStart);
-                contentLength = static_cast<std::size_t>(std::stoul(trim(headers.substr(valueStart, valueEnd - valueStart))));
+                const std::size_t valueEnd   = headers.find("\r\n", valueStart);
+                contentLength = static_cast<std::size_t>(
+                    std::stoul(trim(headers.substr(valueStart, valueEnd - valueStart))));
             }
         }
         if (headersComplete) {
             const std::size_t bodyStart = request.find("\r\n\r\n");
-            const std::size_t bodySize = request.size() - (bodyStart + 4);
+            const std::size_t bodySize  = request.size() - (bodyStart + 4);
             if (bodySize >= contentLength) break;
         }
     }
@@ -429,7 +470,7 @@ AppServer::HttpRequest AppServer::parseRequest(const std::string& rawRequest) {
     request.query = queryPos == std::string::npos ? std::string() : request.target.substr(queryPos + 1);
 
     const std::size_t headerStart = requestLineEnd + 2;
-    const std::size_t bodyPos = rawRequest.find("\r\n\r\n");
+    const std::size_t bodyPos     = rawRequest.find("\r\n\r\n");
     const std::string headerBlock = bodyPos == std::string::npos
         ? rawRequest.substr(headerStart)
         : rawRequest.substr(headerStart, bodyPos - headerStart);
@@ -467,9 +508,9 @@ std::map<std::string, std::string> AppServer::parseQuery(const std::string& quer
     std::map<std::string, std::string> result;
     std::size_t start = 0;
     while (start <= query.size()) {
-        const std::size_t amp = query.find('&', start);
+        const std::size_t amp  = query.find('&', start);
         const std::string pair = query.substr(start, amp == std::string::npos ? std::string::npos : amp - start);
-        const std::size_t eq = pair.find('=');
+        const std::size_t eq   = pair.find('=');
         const std::string key   = decodeUrl(eq == std::string::npos ? pair : pair.substr(0, eq));
         const std::string value = decodeUrl(eq == std::string::npos ? std::string() : pair.substr(eq + 1));
         if (!key.empty()) result[key] = value;
@@ -618,13 +659,27 @@ AppServer::HttpResponse AppServer::unauthorized(const std::string& message) cons
 }
 
 AppServer::HttpResponse AppServer::jsonResponse(int status, const std::string& body) const {
-    return {status, "application/json; charset=utf-8", body, {}};
+    return {status, "application/json; charset=utf-8", body, {
+        {"Access-Control-Allow-Origin",  "*"},
+        {"Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"},
+        {"Access-Control-Allow-Headers", "Authorization, Content-Type"}
+    }};
 }
 
 // ============================================================
 // handleRequest — all routes
 // ============================================================
 AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
+    // Handle CORS preflight for all /api/* paths
+    if (request.method == "OPTIONS") {
+        return {204, "text/plain; charset=utf-8", "", {
+            {"Access-Control-Allow-Origin",  "*"},
+            {"Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS"},
+            {"Access-Control-Allow-Headers", "Authorization, Content-Type"},
+            {"Access-Control-Max-Age",        "86400"}
+        }};
+    }
+
     const auto query = parseQuery(request.query);
 
     auto pathParam = [&](const std::string& prefix) -> std::string {
@@ -839,14 +894,13 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     }
 
     // ===========================================================
-    // DATABASE-BACKED API — /api/* (canonical) + /api/db/* (alias)
-    // Normalize: rewrite /api/db/... -> /api/... for single implementation
+    // DATABASE-BACKED API
+    // Normalize: rewrite /api/db/... -> /api/...
     // ===========================================================
     std::string normPath = request.path;
     if (normPath.rfind("/api/db/", 0) == 0)
         normPath = "/api/" + normPath.substr(8);
 
-    // lambdas operating on normPath
     auto normPathParam = [&](const std::string& prefix) -> std::string {
         if (normPath.rfind(prefix, 0) == 0 && normPath.size() > prefix.size()) {
             std::string rest = normPath.substr(prefix.size());
@@ -870,13 +924,13 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             for (size_t i = 0; i < accs.size(); ++i) {
                 if (i) o << ",";
                 auto& a = accs[i];
-                o << "{\"id\":"        << jsonString(a.id)
-                  << ",\"name\":"      << jsonString(a.name)
-                  << ",\"type\":"      << jsonString(a.type)
-                  << ",\"currency\":" << jsonString(a.currency)
-                  << ",\"bank_name\":" << jsonString(a.bankName)
-                  << ",\"iban\":"      << jsonString(a.iban)
-                  << ",\"balance\":"   << a.balance
+                o << "{\"id\":"         << jsonString(a.id)
+                  << ",\"name\":"       << jsonString(a.name)
+                  << ",\"type\":"       << jsonString(a.type)
+                  << ",\"currency\":"   << jsonString(a.currency)
+                  << ",\"bank_name\":"  << jsonString(a.bankName)
+                  << ",\"iban\":"       << jsonString(a.iban)
+                  << ",\"balance\":"    << a.balance
                   << ",\"created_at\":" << jsonString(a.createdAt)
                   << ",\"updated_at\":" << jsonString(a.updatedAt) << "}";
             }
@@ -903,9 +957,9 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             if (!apiAuthorized(request)) return unauthorized("Unauthorized");
             if (request.method == "PUT") {
                 db::Account a; a.id = aid;
-                a.name     = jf("name");     a.type     = jf("type");
-                a.currency = jf("currency"); a.balance  = ji("balance");
-                a.bankName = jf("bank_name"); a.iban    = jf("iban");
+                a.name     = jf("name");      a.type     = jf("type");
+                a.currency = jf("currency");  a.balance  = ji("balance");
+                a.bankName = jf("bank_name"); a.iban     = jf("iban");
                 db_->upsertAccount(a);
                 return jsonResponse(200, "{\"ok\":true}");
             }
@@ -1198,7 +1252,7 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             std::string sid = normPathParam("/api/savings/");
             if (!sid.empty()) {
                 if (!apiAuthorized(request)) return unauthorized("Unauthorized");
-                int64_t id = std::strtoll(sid.c_str(), nullptr, 10);
+                int64_t id   = std::strtoll(sid.c_str(), nullptr, 10);
                 std::string suffix = normPathSuffix("/api/savings/", sid);
                 if (suffix == "entry" && request.method == "PUT") {
                     db::SavingsEntry e;
@@ -1353,6 +1407,7 @@ std::string AppServer::buildResponse(const HttpResponse& response) {
     switch (response.status) {
         case 200: out << "OK"; break;
         case 201: out << "Created"; break;
+        case 204: out << "No Content"; break;
         case 301: out << "Moved Permanently"; break;
         case 302: out << "Found"; break;
         case 308: out << "Permanent Redirect"; break;
@@ -1364,8 +1419,8 @@ std::string AppServer::buildResponse(const HttpResponse& response) {
         default:  out << "OK"; break;
     }
     out << "\r\n";
-    out << "Content-Type: "   << response.contentType      << "\r\n";
-    out << "Content-Length: " << response.body.size()       << "\r\n";
+    out << "Content-Type: "   << response.contentType << "\r\n";
+    out << "Content-Length: " << response.body.size() << "\r\n";
     out << "Connection: close\r\n";
     out << "Cache-Control: no-store\r\n";
     for (const auto& header : response.headers)
