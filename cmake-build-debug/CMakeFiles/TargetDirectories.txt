@@ -1,0 +1,3 @@
+/home/maks/repos/BanksConnectApp/cmake-build-debug/CMakeFiles/BanksConnectApp.dir
+/home/maks/repos/BanksConnectApp/cmake-build-debug/CMakeFiles/edit_cache.dir
+/home/maks/repos/BanksConnectApp/cmake-build-debug/CMakeFiles/rebuild_cache.dir

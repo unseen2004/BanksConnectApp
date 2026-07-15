@@ -7,6 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     curl \
     openssl \
+    pkg-config \
+    libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -23,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     openssl \
+    libsqlite3-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

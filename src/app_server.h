@@ -2,11 +2,13 @@
 #define BANKSCONNECTAPP_APP_SERVER_H
 
 #include "acc.h"
+#include "database.h"
 #include "enablebanking_client.h"
 #include "trans.h"
 
 #include <atomic>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -38,6 +40,7 @@ private:
 
     EnableBankingConfig config_;
     EnableBankingClient client_;
+    std::unique_ptr<db::Database> db_;
     std::atomic<bool> running_;
     std::thread syncThread_;
     mutable std::mutex stateMutex_;

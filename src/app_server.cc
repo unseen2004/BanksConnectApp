@@ -67,6 +67,16 @@ void AppServer::run() {
     std::cout << "Starting service on port " << port << std::endl;
     std::cout << "Callback URL: " << config_.redirectUri << std::endl;
 
+    // Initialize SQLite database
+    if (!config_.dataDir.empty()) {
+        const std::string dbPath = config_.dataDir + "/banksconnect.db";
+        db_ = std::make_unique<db::Database>(dbPath);
+        std::cout << "Database: " << dbPath << std::endl;
+    } else {
+        db_ = std::make_unique<db::Database>(":memory:");
+        std::cout << "Database: in-memory (set ENABLEBANKING_DATA_DIR for persistence)" << std::endl;
+    }
+
     // Load persisted sessions from disk
     loadSessions();
 
@@ -170,6 +180,46 @@ void AppServer::syncOnce(const std::string& reason) {
 
     summary << " accounts=" << accounts.size()
             << " transactions=" << transactions.size();
+
+    if (db_) {
+        for (const auto& a : accounts) {
+            db::Account dba;
+            dba.id = "bank_acc_" + a.getName();
+            dba.name = a.getName();
+            dba.type = "bank";
+            dba.currency = "PLN";
+            dba.balance = a.getBalance() * 100; // to grosz
+            db_->upsertAccount(dba);
+        }
+        int newTxCount = 0;
+        for (const auto& t : transactions) {
+            std::string bankTxId = t.name + "_" + t.date; // fallback dedup
+            if (!db_->txExists(bankTxId)) {
+                db::Transaction dbt;
+                dbt.id = db_->uuid();
+                dbt.accountId = "bank_acc_" + (accounts.empty() ? "unknown" : accounts.front().getName());
+                dbt.name = t.name;
+                dbt.description = t.opis;
+                dbt.amount = t.amount * 100; // to grosz
+                dbt.currency = "PLN";
+                dbt.fromParty = t.from;
+                dbt.toParty = t.to;
+                dbt.type = t.amount < 0 ? "expense" : "income";
+                dbt.category = "other";
+                dbt.date = t.date;
+                dbt.source = "bank";
+                dbt.bankTxId = bankTxId;
+                db_->insertTx(dbt);
+                newTxCount++;
+            }
+        }
+        db::SyncRec rec;
+        rec.syncedAt = db::Database::now();
+        rec.bankName = "All Banks Sync";
+        rec.newTx = newTxCount;
+        rec.details = summary.str();
+        db_->recordSync(rec);
+    }
 
     std::lock_guard<std::mutex> lock(stateMutex_);
     accounts_ = std::move(accounts);
@@ -834,6 +884,379 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             return unauthorized(config_.apiToken.empty() ? "API token not configured" : "Unauthorized");
         }
         return jsonResponse(200, renderAccountsJson());
+    }
+
+    // ===== DATABASE-BACKED API =====
+    // Helper: extract path param like /api/transactions/UUID
+    auto pathParam = [&](const std::string& prefix) -> std::string {
+        if (request.path.rfind(prefix, 0) == 0 && request.path.size() > prefix.size()) {
+            std::string rest = request.path.substr(prefix.size());
+            auto slash = rest.find('/');
+            return slash == std::string::npos ? rest : rest.substr(0, slash);
+        }
+        return "";
+    };
+    auto pathSuffix = [&](const std::string& prefix, const std::string& id) -> std::string {
+        std::string full = prefix + id + "/";
+        if (request.path.rfind(full, 0) == 0) return request.path.substr(full.size());
+        return "";
+    };
+    // Helper: extract JSON string field from body
+    auto jf = [&](const std::string& key) -> std::string {
+        std::string pat = "\"" + key + "\"";
+        auto p = request.body.find(pat);
+        if (p == std::string::npos) return "";
+        auto c = request.body.find(':', p + pat.size());
+        if (c == std::string::npos) return "";
+        auto vs = request.body.find_first_not_of(" \t\r\n", c + 1);
+        if (vs == std::string::npos) return "";
+        if (request.body[vs] == '"') {
+            auto ve = request.body.find('"', vs + 1);
+            return ve == std::string::npos ? "" : request.body.substr(vs + 1, ve - vs - 1);
+        }
+        auto ve = request.body.find_first_of(",}\r\n", vs);
+        std::string raw = request.body.substr(vs, ve == std::string::npos ? std::string::npos : ve - vs);
+        while (!raw.empty() && (raw.back() == ' ' || raw.back() == '\t')) raw.pop_back();
+        return raw;
+    };
+    auto ji = [&](const std::string& key) -> int64_t {
+        std::string v = jf(key); return v.empty() ? 0 : std::strtoll(v.c_str(), nullptr, 10);
+    };
+
+    // --- DB Accounts ---
+    if (request.path == "/api/db/accounts") {
+        if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+        if (request.method == "GET") {
+            auto accs = db_->accounts();
+            std::ostringstream o; o << "[";
+            for (size_t i = 0; i < accs.size(); ++i) {
+                if (i) o << ",";
+                auto& a = accs[i];
+                o << "{\"id\":" << jsonString(a.id) << ",\"name\":" << jsonString(a.name)
+                  << ",\"type\":" << jsonString(a.type) << ",\"currency\":" << jsonString(a.currency)
+                  << ",\"bank_name\":" << jsonString(a.bankName) << ",\"iban\":" << jsonString(a.iban)
+                  << ",\"balance\":" << a.balance << ",\"created_at\":" << jsonString(a.createdAt)
+                  << ",\"updated_at\":" << jsonString(a.updatedAt) << "}";
+            }
+            o << "]";
+            return jsonResponse(200, o.str());
+        }
+        if (request.method == "POST") {
+            db::Account a; a.id = db_->uuid(); a.name = jf("name"); a.type = jf("type");
+            if (a.type.empty()) a.type = "wallet";
+            a.currency = jf("currency"); if (a.currency.empty()) a.currency = "PLN";
+            a.balance = ji("balance"); a.bankName = jf("bank_name"); a.iban = jf("iban");
+            db_->upsertAccount(a);
+            return jsonResponse(201, "{\"id\":" + jsonString(a.id) + "}");
+        }
+    }
+    {
+        std::string aid = pathParam("/api/db/accounts/");
+        if (!aid.empty()) {
+            if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+            if (request.method == "PUT") {
+                db::Account a; a.id = aid; a.name = jf("name"); a.type = jf("type");
+                a.currency = jf("currency"); a.balance = ji("balance");
+                a.bankName = jf("bank_name"); a.iban = jf("iban");
+                db_->upsertAccount(a);
+                return jsonResponse(200, "{\"ok\":true}");
+            }
+            if (request.method == "DELETE") {
+                db_->deleteAccount(aid);
+                return jsonResponse(200, "{\"ok\":true}");
+            }
+        }
+    }
+
+    // --- DB Transactions ---
+    if (request.path == "/api/db/transactions") {
+        if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+        if (request.method == "GET") {
+            std::string acct = query.count("account_id") ? query.at("account_id") : "";
+            std::string from = query.count("from") ? query.at("from") : "";
+            std::string to = query.count("to") ? query.at("to") : "";
+            auto txs = db_->transactions(acct, from, to);
+            std::ostringstream o; o << "[";
+            for (size_t i = 0; i < txs.size(); ++i) {
+                if (i) o << ",";
+                auto& t = txs[i];
+                auto subs = db_->subTx(t.id);
+                auto edits = db_->txHistory(t.id);
+                o << "{\"id\":" << jsonString(t.id) << ",\"account_id\":" << jsonString(t.accountId)
+                  << ",\"name\":" << jsonString(t.name) << ",\"description\":" << jsonString(t.description)
+                  << ",\"amount\":" << t.amount << ",\"currency\":" << jsonString(t.currency)
+                  << ",\"from\":" << jsonString(t.fromParty) << ",\"to\":" << jsonString(t.toParty)
+                  << ",\"type\":" << jsonString(t.type) << ",\"category\":" << jsonString(t.category)
+                  << ",\"tag\":" << jsonString(t.tag) << ",\"date\":" << jsonString(t.date)
+                  << ",\"source\":" << jsonString(t.source)
+                  << ",\"edited\":" << (edits.empty() ? "false" : "true")
+                  << ",\"edit_count\":" << edits.size()
+                  << ",\"splits\":[";
+                for (size_t j = 0; j < subs.size(); ++j) {
+                    if (j) o << ",";
+                    o << "{\"id\":" << jsonString(subs[j].id) << ",\"name\":" << jsonString(subs[j].name)
+                      << ",\"amount\":" << subs[j].amount << ",\"category\":" << jsonString(subs[j].category) << "}";
+                }
+                o << "]}";
+            }
+            o << "]";
+            return jsonResponse(200, o.str());
+        }
+        if (request.method == "POST") {
+            db::Transaction t; t.id = db_->uuid(); t.accountId = jf("account_id");
+            t.name = jf("name"); t.description = jf("description"); t.amount = ji("amount");
+            t.currency = jf("currency"); if (t.currency.empty()) t.currency = "PLN";
+            t.fromParty = jf("from"); t.toParty = jf("to");
+            t.type = jf("type"); if (t.type.empty()) t.type = "expense";
+            t.category = jf("category"); if (t.category.empty()) t.category = "other";
+            t.tag = jf("tag"); if (t.tag.empty()) t.tag = "opt";
+            t.date = jf("date"); if (t.date.empty()) t.date = db::Database::now().substr(0, 10);
+            t.source = "manual";
+            db_->insertTx(t);
+            return jsonResponse(201, "{\"id\":" + jsonString(t.id) + "}");
+        }
+    }
+    {
+        std::string tid = pathParam("/api/db/transactions/");
+        if (!tid.empty()) {
+            if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+            std::string suffix = pathSuffix("/api/db/transactions/", tid);
+            if (suffix == "history" && request.method == "GET") {
+                auto edits = db_->txHistory(tid);
+                std::ostringstream o; o << "[";
+                for (size_t i = 0; i < edits.size(); ++i) {
+                    if (i) o << ",";
+                    o << "{\"field\":" << jsonString(edits[i].field) << ",\"old\":" << jsonString(edits[i].oldVal)
+                      << ",\"new\":" << jsonString(edits[i].newVal) << ",\"at\":" << jsonString(edits[i].editedAt) << "}";
+                }
+                o << "]";
+                return jsonResponse(200, o.str());
+            }
+            if (suffix == "split" && request.method == "POST") {
+                // Parse parts array from body — simplified: expects {"parts":[{"name":"A","amount":100,"category":"food"}, ...]}
+                db::Transaction parent = db_->transaction(tid);
+                std::vector<db::Transaction> parts;
+                std::string body = request.body;
+                size_t pos = 0;
+                while (true) {
+                    pos = body.find("{", pos + 1);
+                    if (pos == std::string::npos || pos < 10) break; // skip outer {
+                    size_t end = body.find("}", pos);
+                    if (end == std::string::npos) break;
+                    std::string obj = body.substr(pos, end - pos + 1);
+                    // mini parse
+                    auto of = [&](const std::string& k) -> std::string {
+                        auto p2 = obj.find("\"" + k + "\"");
+                        if (p2 == std::string::npos) return "";
+                        auto c = obj.find(':', p2); if (c == std::string::npos) return "";
+                        auto vs = obj.find_first_not_of(" \t\"", c + 1);
+                        auto ve = obj.find_first_of(",}\"", vs);
+                        return obj.substr(vs, ve - vs);
+                    };
+                    db::Transaction p; p.accountId = parent.accountId;
+                    p.name = of("name"); p.category = of("category");
+                    std::string amt = of("amount"); p.amount = amt.empty() ? 0 : std::strtoll(amt.c_str(), nullptr, 10);
+                    p.currency = parent.currency; p.date = parent.date; p.type = parent.type;
+                    p.source = parent.source; p.tag = parent.tag;
+                    parts.push_back(p);
+                    pos = end;
+                }
+                db_->splitTx(tid, parts);
+                return jsonResponse(200, "{\"ok\":true,\"parts\":" + std::to_string(parts.size()) + "}");
+            }
+            if (request.method == "PUT") {
+                db::Transaction t = db_->transaction(tid);
+                if (!jf("name").empty()) t.name = jf("name");
+                if (!jf("description").empty()) t.description = jf("description");
+                if (!jf("category").empty()) t.category = jf("category");
+                if (!jf("tag").empty()) t.tag = jf("tag");
+                if (!jf("from").empty()) t.fromParty = jf("from");
+                if (!jf("to").empty()) t.toParty = jf("to");
+                if (!jf("type").empty()) t.type = jf("type");
+                if (!jf("date").empty()) t.date = jf("date");
+                if (!jf("amount").empty()) t.amount = ji("amount");
+                db_->updateTx(tid, t);
+                return jsonResponse(200, "{\"ok\":true}");
+            }
+            if (request.method == "DELETE") {
+                db_->deleteTx(tid);
+                return jsonResponse(200, "{\"ok\":true}");
+            }
+        }
+    }
+
+    // --- Categories ---
+    if (request.path == "/api/db/categories") {
+        if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+        if (request.method == "GET") {
+            auto cats = db_->categories();
+            std::ostringstream o; o << "[";
+            for (size_t i = 0; i < cats.size(); ++i) {
+                if (i) o << ",";
+                o << "{\"name\":" << jsonString(cats[i].name) << ",\"icon\":" << jsonString(cats[i].icon)
+                  << ",\"color\":" << jsonString(cats[i].color) << "}";
+            }
+            o << "]"; return jsonResponse(200, o.str());
+        }
+        if (request.method == "POST") {
+            db::Category c; c.name = jf("name"); c.icon = jf("icon"); c.color = jf("color");
+            db_->upsertCategory(c);
+            return jsonResponse(201, "{\"ok\":true}");
+        }
+    }
+
+    // --- Budgets ---
+    if (request.path == "/api/db/budgets") {
+        if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+        std::string ym = query.count("month") ? query.at("month") : "";
+        if (request.method == "GET") {
+            auto bs = db_->budgets(ym);
+            std::ostringstream o; o << "[";
+            for (size_t i = 0; i < bs.size(); ++i) {
+                if (i) o << ",";
+                o << "{\"category\":" << jsonString(bs[i].category)
+                  << ",\"planned\":" << bs[i].planned << ",\"year_month\":" << jsonString(bs[i].yearMonth) << "}";
+            }
+            o << "]"; return jsonResponse(200, o.str());
+        }
+        if (request.method == "POST") {
+            db::Budget b; b.yearMonth = jf("year_month"); b.category = jf("category"); b.planned = ji("planned");
+            db_->upsertBudget(b);
+            return jsonResponse(201, "{\"ok\":true}");
+        }
+    }
+    if (request.path == "/api/db/budgets/summary") {
+        if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+        std::string ym = query.count("month") ? query.at("month") : "";
+        auto lines = db_->budgetSummary(ym);
+        std::ostringstream o; o << "[";
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (i) o << ",";
+            o << "{\"category\":" << jsonString(lines[i].category)
+              << ",\"planned\":" << lines[i].planned << ",\"actual\":" << lines[i].actual << "}";
+        }
+        o << "]"; return jsonResponse(200, o.str());
+    }
+
+    // --- Todos ---
+    if (request.path == "/api/db/todos") {
+        if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+        if (request.method == "GET") {
+            auto ts = db_->todos();
+            std::ostringstream o; o << "[";
+            for (size_t i = 0; i < ts.size(); ++i) {
+                if (i) o << ",";
+                o << "{\"id\":" << ts[i].id << ",\"name\":" << jsonString(ts[i].name)
+                  << ",\"description\":" << jsonString(ts[i].description)
+                  << ",\"amount\":" << ts[i].amount << ",\"due_date\":" << jsonString(ts[i].dueDate)
+                  << ",\"done\":" << (ts[i].done ? "true" : "false") << "}";
+            }
+            o << "]"; return jsonResponse(200, o.str());
+        }
+        if (request.method == "POST") {
+            db::Todo t; t.name = jf("name"); t.description = jf("description");
+            t.amount = ji("amount"); t.dueDate = jf("due_date");
+            auto id = db_->insertTodo(t);
+            return jsonResponse(201, "{\"id\":" + std::to_string(id) + "}");
+        }
+    }
+    {
+        std::string tid = pathParam("/api/db/todos/");
+        if (!tid.empty()) {
+            if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+            int64_t id = std::strtoll(tid.c_str(), nullptr, 10);
+            if (request.method == "PUT") {
+                db::Todo t; t.name = jf("name"); t.description = jf("description");
+                t.amount = ji("amount"); t.dueDate = jf("due_date");
+                t.done = jf("done") == "true" || jf("done") == "1";
+                db_->updateTodo(id, t);
+                return jsonResponse(200, "{\"ok\":true}");
+            }
+            if (request.method == "DELETE") {
+                db_->deleteTodo(id);
+                return jsonResponse(200, "{\"ok\":true}");
+            }
+        }
+    }
+
+    // --- Savings Goals ---
+    if (request.path == "/api/db/savings") {
+        if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+        if (request.method == "GET") {
+            auto gs = db_->savingsGoals();
+            std::ostringstream o; o << "[";
+            for (size_t i = 0; i < gs.size(); ++i) {
+                if (i) o << ",";
+                auto entries = db_->savingsEntries(gs[i].id);
+                o << "{\"id\":" << gs[i].id << ",\"name\":" << jsonString(gs[i].name)
+                  << ",\"target\":" << gs[i].target << ",\"deadline\":" << jsonString(gs[i].deadline)
+                  << ",\"entries\":[";
+                for (size_t j = 0; j < entries.size(); ++j) {
+                    if (j) o << ",";
+                    o << "{\"year_month\":" << jsonString(entries[j].yearMonth)
+                      << ",\"planned\":" << entries[j].planned << ",\"actual\":" << entries[j].actual << "}";
+                }
+                o << "]}";
+            }
+            o << "]"; return jsonResponse(200, o.str());
+        }
+        if (request.method == "POST") {
+            db::SavingsGoal g; g.name = jf("name"); g.target = ji("target"); g.deadline = jf("deadline");
+            auto id = db_->insertGoal(g);
+            return jsonResponse(201, "{\"id\":" + std::to_string(id) + "}");
+        }
+    }
+    {
+        std::string sid = pathParam("/api/db/savings/");
+        if (!sid.empty()) {
+            if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+            int64_t id = std::strtoll(sid.c_str(), nullptr, 10);
+            std::string suffix = pathSuffix("/api/db/savings/", sid);
+            if (suffix == "entry" && request.method == "PUT") {
+                db::SavingsEntry e; e.goalId = id; e.yearMonth = jf("year_month");
+                e.planned = ji("planned"); e.actual = ji("actual");
+                db_->upsertEntry(e);
+                return jsonResponse(200, "{\"ok\":true}");
+            }
+            if (request.method == "DELETE") {
+                db_->deleteGoal(id);
+                return jsonResponse(200, "{\"ok\":true}");
+            }
+        }
+    }
+
+    // --- Sync History ---
+    if (request.path == "/api/db/sync/history") {
+        if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+        auto recs = db_->syncHistory();
+        std::ostringstream o; o << "[";
+        for (size_t i = 0; i < recs.size(); ++i) {
+            if (i) o << ",";
+            o << "{\"id\":" << recs[i].id << ",\"synced_at\":" << jsonString(recs[i].syncedAt)
+              << ",\"bank_name\":" << jsonString(recs[i].bankName)
+              << ",\"new_tx_count\":" << recs[i].newTx << ",\"details\":" << jsonString(recs[i].details) << "}";
+        }
+        o << "]"; return jsonResponse(200, o.str());
+    }
+    if (request.path == "/api/db/sync/now" && request.method == "POST") {
+        if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+        try { syncOnce("api-trigger"); return jsonResponse(200, "{\"ok\":true}"); }
+        catch (const std::exception& e) { return jsonResponse(500, "{\"error\":" + jsonString(e.what()) + "}"); }
+    }
+
+    // --- Stats ---
+    if (request.path == "/api/db/stats") {
+        if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+        std::string from = query.count("from") ? query.at("from") : "";
+        std::string to = query.count("to") ? query.at("to") : "";
+        auto rows = db_->stats(from, to);
+        std::ostringstream o; o << "[";
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (i) o << ",";
+            o << "{\"category\":" << jsonString(rows[i].category)
+              << ",\"year_month\":" << jsonString(rows[i].yearMonth) << ",\"total\":" << rows[i].total << "}";
+        }
+        o << "]"; return jsonResponse(200, o.str());
     }
 
     return {404, "text/plain; charset=utf-8", "not found", {}};

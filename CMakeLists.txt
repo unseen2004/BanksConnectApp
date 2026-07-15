@@ -4,6 +4,8 @@ project(BanksConnectApp)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SQLITE3 REQUIRED sqlite3)
 
 add_executable(BanksConnectApp
         main.cpp
@@ -13,7 +15,8 @@ add_executable(BanksConnectApp
         src/app_server.cc
         src/json_mapper.cc
         src/webhook_server.cc
+        src/database.cc
 )
 
-target_include_directories(BanksConnectApp PRIVATE src)
-target_link_libraries(BanksConnectApp PRIVATE Threads::Threads)
+target_include_directories(BanksConnectApp PRIVATE src ${SQLITE3_INCLUDE_DIRS})
+target_link_libraries(BanksConnectApp PRIVATE Threads::Threads ${SQLITE3_LIBRARIES})
