@@ -206,7 +206,7 @@ void AppServer::syncOnce(const std::string& reason) {
                 dbt.accountId = "bank_acc_" + (accounts.empty() ? "unknown" : accounts.front().getName());
                 dbt.name = t.name;
                 dbt.description = t.opis;
-                dbt.amount = t.amount * 100; // to grosz
+                dbt.amount = t.amount; // already in grosz
                 dbt.currency = "PLN";
                 dbt.fromParty = t.from;
                 dbt.toParty = t.to;

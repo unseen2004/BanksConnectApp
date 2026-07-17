@@ -207,8 +207,12 @@ std::vector<trans> parseTransactions(const std::string& json) {
         
         // Date parsing
         transaction.date = extractStringValue(object, "bookingDate");
+        if (transaction.date.empty()) transaction.date = extractStringValue(object, "bookingDateTime");
         if (transaction.date.empty()) transaction.date = extractStringValue(object, "valueDate");
+        if (transaction.date.empty()) transaction.date = extractStringValue(object, "valueDateTime");
+        if (transaction.date.empty()) transaction.date = extractStringValue(object, "transactionDate");
         if (transaction.date.empty()) transaction.date = extractStringValue(object, "date");
+        if (transaction.date.size() > 10) transaction.date = transaction.date.substr(0, 10);
 
         // Description parsing
         transaction.opis = extractStringValue(object, "remittanceInformationUnstructured");
@@ -222,6 +226,13 @@ std::vector<trans> parseTransactions(const std::string& json) {
             stream.imbue(std::locale::classic());
             stream >> parsedAmount;
         }
+        
+        // Handle PSD2 DBIT indicator
+        std::string indicator = extractStringValue(object, "creditDebitIndicator");
+        if ((indicator == "DBIT" || indicator == "dbit") && parsedAmount > 0) {
+            parsedAmount = -parsedAmount;
+        }
+        
         transaction.amount = static_cast<int>(parsedAmount * 100.0);
         
         // Type inference based on amount
