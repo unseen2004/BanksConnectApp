@@ -18,5 +18,6 @@ add_executable(BanksConnectApp
         src/database.cc
 )
 
-target_include_directories(BanksConnectApp PRIVATE src ${SQLITE3_INCLUDE_DIRS})
-target_link_libraries(BanksConnectApp PRIVATE Threads::Threads ${SQLITE3_LIBRARIES})
+find_package(OpenSSL REQUIRED)
+target_include_directories(BanksConnectApp PRIVATE src ${SQLITE3_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+target_link_libraries(BanksConnectApp PRIVATE Threads::Threads ${SQLITE3_LIBRARIES} OpenSSL::Crypto)

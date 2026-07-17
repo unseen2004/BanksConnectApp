@@ -1,4 +1,6 @@
 #include "json_mapper.h"
+#include <locale>
+#include <sstream>
 
 #include <algorithm>
 #include <cctype>
@@ -175,8 +177,16 @@ std::vector<acc> parseAccounts(const std::string& json) {
         if (name.empty()) {
             name = extractStringValue(object, "id");
         }
-        const int balance = extractIntValue(object, "balance", extractIntValue(object, "availableBalance", 0));
-        accounts.emplace_back(name.empty() ? "unknown-account" : name, balance);
+        std::string balStr = extractStringValue(object, "balance");
+        if (balStr.empty()) balStr = extractStringValue(object, "availableBalance");
+        int balanceGrosz = 0;
+        try {
+            std::istringstream iss(balStr);
+            iss.imbue(std::locale::classic());
+            double d = 0;
+            if (iss >> d) balanceGrosz = static_cast<int>(d * 100);
+        } catch (...) {}
+        accounts.emplace_back(name.empty() ? "unknown-account" : name, balanceGrosz);
     }
     return accounts;
 }
@@ -188,22 +198,47 @@ std::vector<trans> parseTransactions(const std::string& json) {
     transactions.reserve(objects.size());
     for (const std::string& object : objects) {
         trans transaction{};
-        transaction.name = extractStringValue(object, "name");
-        if (transaction.name.empty()) {
-            transaction.name = extractStringValue(object, "description");
+        
+        // Name parsing
+        transaction.name = extractStringValue(object, "creditorName");
+        if (transaction.name.empty()) transaction.name = extractStringValue(object, "debtorName");
+        if (transaction.name.empty()) transaction.name = extractStringValue(object, "remittanceInformationUnstructured");
+        if (transaction.name.empty()) transaction.name = extractStringValue(object, "name");
+        
+        // Date parsing
+        transaction.date = extractStringValue(object, "bookingDate");
+        if (transaction.date.empty()) transaction.date = extractStringValue(object, "valueDate");
+        if (transaction.date.empty()) transaction.date = extractStringValue(object, "date");
+
+        // Description parsing
+        transaction.opis = extractStringValue(object, "remittanceInformationUnstructured");
+        if (transaction.opis.empty()) transaction.opis = extractStringValue(object, "description");
+        
+        // Amount parsing (handles negative and decimal values properly)
+        std::string amountStr = extractStringValue(object, "amount");
+        double parsedAmount = 0.0;
+        if (!amountStr.empty()) {
+            std::istringstream stream(amountStr);
+            stream.imbue(std::locale::classic());
+            stream >> parsedAmount;
         }
-        if (transaction.name.empty()) {
-            transaction.name = extractStringValue(object, "transactionId");
+        transaction.amount = static_cast<int>(parsedAmount * 100.0);
+        
+        // Type inference based on amount
+        if (transaction.amount < 0) {
+            transaction.type = my::type::expense;
+        } else if (transaction.amount > 0) {
+            transaction.type = my::type::income;
+        } else {
+            transaction.type = my::type::expense;
         }
-        transaction.opis = extractStringValue(object, "description");
-        transaction.amount = extractIntValue(object, "amount", 0);
+        
         transaction.curr = parseCurrency(extractStringValue(object, "currency"));
-        transaction.from = extractStringValue(object, "from");
-        transaction.to = extractStringValue(object, "to");
-        transaction.type = parseTransactionType(extractStringValue(object, "type"));
+        transaction.from = extractStringValue(object, "debtorName");
+        transaction.to = extractStringValue(object, "creditorName");
         transaction.category = my::category::other;
-        transaction.date = extractStringValue(object, "date");
         transaction.tag = my::tag::opt;
+        
         transactions.push_back(transaction);
     }
     return transactions;

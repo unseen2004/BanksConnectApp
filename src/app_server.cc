@@ -1,4 +1,5 @@
 #include "app_server.h"
+#include <locale>
 
 #include "json_mapper.h"
 
@@ -148,7 +149,12 @@ void AppServer::syncOnce(const std::string& reason) {
                 }
             }
             int balance = 0;
-            try { balance = static_cast<int>(std::stod(balanceStr)); } catch (...) {}
+            try {
+                std::istringstream iss(balanceStr);
+                iss.imbue(std::locale::classic());
+                double d = 0;
+                if (iss >> d) balance = static_cast<int>(d * 100);
+            } catch (...) {}
 
             accounts.emplace_back(accountId, balance);
 
@@ -188,7 +194,7 @@ void AppServer::syncOnce(const std::string& reason) {
             dba.name = a.getName();
             dba.type = "bank";
             dba.currency = "PLN";
-            dba.balance = a.getBalance() * 100; // to grosz
+            dba.balance = a.getBalance(); // already in grosz
             db_->upsertAccount(dba);
         }
         int newTxCount = 0;

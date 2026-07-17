@@ -12,6 +12,9 @@
 #include <iostream>
 #include <utility>
 #include <vector>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/err.h>
 
 namespace {
 constexpr const char* kStatusMarker = "\n__ENABLEBANKING_STATUS__:";
@@ -201,61 +204,36 @@ std::string EnableBankingClient::base64UrlEncode(const std::string& value) {
 }
 
 std::string EnableBankingClient::signWithOpenSsl(const std::string& message, const std::string& privateKeyPath) {
-    int stdinPipe[2];
-    int stdoutPipe[2];
-    if (::pipe(stdinPipe) != 0) {
-        throw std::runtime_error(std::string("pipe failed: ") + std::strerror(errno));
-    }
-    if (::pipe(stdoutPipe) != 0) {
-        ::close(stdinPipe[0]);
-        ::close(stdinPipe[1]);
-        throw std::runtime_error(std::string("pipe failed: ") + std::strerror(errno));
-    }
+    FILE* keyFile = fopen(privateKeyPath.c_str(), "r");
+    if (!keyFile) throw std::runtime_error("Could not open private key file: " + privateKeyPath);
+    EVP_PKEY* pkey = PEM_read_PrivateKey(keyFile, nullptr, nullptr, nullptr);
+    fclose(keyFile);
+    if (!pkey) throw std::runtime_error("Could not read private key from " + privateKeyPath);
 
-    const pid_t pid = ::fork();
-    if (pid < 0) {
-        ::close(stdinPipe[0]);
-        ::close(stdinPipe[1]);
-        ::close(stdoutPipe[0]);
-        ::close(stdoutPipe[1]);
-        throw std::runtime_error(std::string("fork failed: ") + std::strerror(errno));
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) { EVP_PKEY_free(pkey); throw std::runtime_error("EVP_MD_CTX_new failed"); }
+
+    if (EVP_DigestSignInit(ctx, nullptr, EVP_sha256(), nullptr, pkey) <= 0) {
+        EVP_MD_CTX_free(ctx); EVP_PKEY_free(pkey); throw std::runtime_error("EVP_DigestSignInit failed");
     }
 
-    if (pid == 0) {
-        ::close(stdinPipe[1]);
-        ::close(stdoutPipe[0]);
-        ::dup2(stdinPipe[0], STDIN_FILENO);
-        ::dup2(stdoutPipe[1], STDOUT_FILENO);
-        ::close(stdinPipe[0]);
-        ::close(stdoutPipe[1]);
-
-        std::vector<char*> argv;
-        argv.push_back(const_cast<char*>("openssl"));
-        argv.push_back(const_cast<char*>("dgst"));
-        argv.push_back(const_cast<char*>("-sha256"));
-        argv.push_back(const_cast<char*>("-sign"));
-        argv.push_back(const_cast<char*>(privateKeyPath.c_str()));
-        argv.push_back(nullptr);
-        ::execvp("openssl", argv.data());
-        _exit(127);
+    if (EVP_DigestSignUpdate(ctx, message.data(), message.size()) <= 0) {
+        EVP_MD_CTX_free(ctx); EVP_PKEY_free(pkey); throw std::runtime_error("EVP_DigestSignUpdate failed");
     }
 
-    ::close(stdinPipe[0]);
-    ::close(stdoutPipe[1]);
-    const ssize_t written = ::write(stdinPipe[1], message.data(), message.size());
-    (void)written;
-    ::close(stdinPipe[1]);
-
-    const std::string signature = readAll(stdoutPipe[0]);
-    ::close(stdoutPipe[0]);
-
-    int status = 0;
-    if (::waitpid(pid, &status, 0) < 0) {
-        throw std::runtime_error(std::string("waitpid failed: ") + std::strerror(errno));
+    size_t sigLen = 0;
+    if (EVP_DigestSignFinal(ctx, nullptr, &sigLen) <= 0) {
+        EVP_MD_CTX_free(ctx); EVP_PKEY_free(pkey); throw std::runtime_error("EVP_DigestSignFinal failed (length)");
     }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        throw std::runtime_error("openssl signing failed");
+
+    std::string signature(sigLen, '\0');
+    if (EVP_DigestSignFinal(ctx, reinterpret_cast<unsigned char*>(&signature[0]), &sigLen) <= 0) {
+        EVP_MD_CTX_free(ctx); EVP_PKEY_free(pkey); throw std::runtime_error("EVP_DigestSignFinal failed");
     }
+    signature.resize(sigLen);
+
+    EVP_MD_CTX_free(ctx);
+    EVP_PKEY_free(pkey);
 
     return signature;
 }

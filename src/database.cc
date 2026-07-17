@@ -15,6 +15,7 @@ static std::string q(const std::string& v){std::string o="'";for(char c:v){if(c=
 Database::Database(const std::string& path){
     if(sqlite3_open(path.c_str(),&db_)!=SQLITE_OK)
         throw std::runtime_error(std::string("sqlite open: ")+sqlite3_errmsg(db_));
+    sqlite3_busy_timeout(db_, 5000);
     exec("PRAGMA journal_mode=WAL");
     exec("PRAGMA foreign_keys=ON");
     init();
