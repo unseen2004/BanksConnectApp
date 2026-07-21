@@ -106,66 +106,117 @@ void AppServer::startSyncLoop() {
 }
 
 void AppServer::syncOnce(const std::string& reason) {
-    // Collect all account IDs from all bank sessions
-    std::vector<std::string> ids;
+    // Snapshot the sessions so each account keeps its owning bank's identity.
+    struct AccountRef {
+        std::string accountId;
+        std::string bankName;
+        std::string bankCountry;
+    };
+    std::vector<AccountRef> refs;
     {
         std::lock_guard<std::mutex> lock(stateMutex_);
         for (const auto& session : bankSessions_) {
             for (const auto& id : session.accountIds) {
-                ids.push_back(id);
+                refs.push_back({id, session.aspspName, session.aspspCountry});
             }
         }
     }
 
     std::vector<acc> accounts;
     std::vector<trans> transactions;
+    std::vector<db::Account> dbAccounts;
+    std::vector<db::Transaction> dbTransactions;
     std::ostringstream summary;
     summary << "reason=" << reason;
 
-    if (!ids.empty()) {
-        // Use proper per-account Enable Banking endpoints
-        for (const std::string& accountId : ids) {
+    auto lastFour = [](const std::string& iban) -> std::string {
+        if (iban.size() <= 4) return iban;
+        return iban.substr(iban.size() - 4);
+    };
+
+    if (!refs.empty()) {
+        // Proper per-account Enable Banking endpoints. Each account is fully
+        // resolved (details + balances + transactions) so we can attach the
+        // right bank name, currency and transactions to it.
+        for (const AccountRef& ref : refs) {
+            const std::string& accountId = ref.accountId;
+            const ::HttpResponse detailsResp = client_.getAccountDetails(accountId);
             const ::HttpResponse balResp = client_.getAccountBalances(accountId);
             const ::HttpResponse txResp = client_.getAccountTransactions(accountId);
 
             summary << " account=" << accountId
+                    << " det_status=" << detailsResp.statusCode
                     << " bal_status=" << balResp.statusCode
                     << " tx_status=" << txResp.statusCode;
 
-            // Parse balance — extract amount from first balance entry
-            std::string balanceStr = "0";
-            {
-                const std::size_t amountPos = balResp.body.find("\"amount\"");
-                if (amountPos != std::string::npos) {
-                    const std::size_t colonPos = balResp.body.find(':', amountPos);
-                    if (colonPos != std::string::npos) {
-                        std::size_t valStart = balResp.body.find_first_not_of(" \t\r\n", colonPos + 1);
-                        if (valStart != std::string::npos) {
-                            if (balResp.body[valStart] == '"') ++valStart;
-                            std::size_t valEnd = balResp.body.find_first_of(",}\"\r\n", valStart);
-                            balanceStr = balResp.body.substr(valStart, valEnd - valStart);
-                        }
-                    }
+            const BankAccountDetails details = parseAccountDetails(detailsResp.body);
+            const BankBalance balance = parseBalance(balResp.body);
+
+            std::string currency = !details.currency.empty() ? details.currency : balance.currency;
+            if (currency.empty()) {
+                currency = "PLN";
+            }
+
+            // Build a human-friendly account name (never a bare UUID).
+            std::string friendlyName = details.name;
+            if (friendlyName.empty()) {
+                friendlyName = ref.bankName;
+                if (!details.iban.empty()) {
+                    friendlyName += " ••" + lastFour(details.iban);
                 }
             }
-            int balance = 0;
-            try {
-                std::istringstream iss(balanceStr);
-                iss.imbue(std::locale::classic());
-                double d = 0;
-                if (iss >> d) balance = static_cast<int>(d * 100);
-            } catch (...) {}
+            if (friendlyName.empty()) {
+                friendlyName = "Bank Account";
+            }
 
-            accounts.emplace_back(accountId, balance);
+            const std::string dbAccountId = "bank_acc_" + accountId;
 
-            std::vector<trans> acctTx = parseTransactions(txResp.body);
+            db::Account dba;
+            dba.id = dbAccountId;
+            dba.name = friendlyName;
+            dba.type = "bank";
+            dba.currency = currency;
+            dba.bankName = ref.bankName;
+            dba.iban = details.iban;
+            dba.balance = balance.minorUnits;
+            dbAccounts.push_back(dba);
+
+            // Keep an in-memory representation for /status.
+            accounts.emplace_back(friendlyName, balance.minorUnits);
+
+            const std::vector<trans> acctTx = parseTransactions(txResp.body);
+            int accountTxCount = 0;
             for (const trans& t : acctTx) {
                 accounts.back().addTransaction(t);
                 transactions.push_back(t);
+
+                db::Transaction dbt;
+                dbt.accountId = dbAccountId;
+                dbt.name = t.name;
+                dbt.description = t.opis;
+                dbt.amount = t.amount;
+                dbt.currency = !t.currencyCode.empty() ? t.currencyCode : currency;
+                dbt.fromParty = t.from;
+                dbt.toParty = t.to;
+                dbt.type = enumToString(t.type);
+                dbt.category = "other";
+                dbt.date = t.date;
+                dbt.source = "bank";
+                // De-duplicate on the real bank id; fall back to a per-account
+                // composite key (never just name+date) so distinct transactions
+                // on the same day are not collapsed.
+                if (!t.bankTxId.empty()) {
+                    dbt.bankTxId = accountId + ":" + t.bankTxId;
+                } else {
+                    dbt.bankTxId = accountId + ":" + t.date + ":" + std::to_string(t.amount) +
+                                   ":" + std::to_string(accountTxCount);
+                }
+                dbTransactions.push_back(dbt);
+                ++accountTxCount;
             }
         }
     } else {
-        // Fallback to legacy generic endpoints (before session is established)
+        // Fallback to legacy generic endpoints (before a session is established).
         const ::HttpResponse accountsResponse = client_.getAccounts();
         const ::HttpResponse balancesResponse = client_.getBalances();
         const ::HttpResponse transactionsResponse = client_.getTransactions();
@@ -173,10 +224,39 @@ void AppServer::syncOnce(const std::string& reason) {
         accounts = parseAccounts(accountsResponse.body);
         transactions = parseTransactions(transactionsResponse.body);
 
-        if (!accounts.empty()) {
-            for (const trans& transaction : transactions) {
-                accounts.front().addTransaction(transaction);
+        const std::string fallbackAccountId = accounts.empty() ? "unknown" : accounts.front().getName();
+        const std::string dbAccountId = "bank_acc_" + fallbackAccountId;
+        for (const auto& a : accounts) {
+            db::Account dba;
+            dba.id = "bank_acc_" + a.getName();
+            dba.name = a.getName();
+            dba.type = "bank";
+            dba.currency = "PLN";
+            dba.balance = a.getBalance();
+            dbAccounts.push_back(dba);
+        }
+        int idx = 0;
+        for (const trans& t : transactions) {
+            if (!accounts.empty()) {
+                accounts.front().addTransaction(t);
             }
+            db::Transaction dbt;
+            dbt.accountId = dbAccountId;
+            dbt.name = t.name;
+            dbt.description = t.opis;
+            dbt.amount = t.amount;
+            dbt.currency = !t.currencyCode.empty() ? t.currencyCode : "PLN";
+            dbt.fromParty = t.from;
+            dbt.toParty = t.to;
+            dbt.type = enumToString(t.type);
+            dbt.category = "other";
+            dbt.date = t.date;
+            dbt.source = "bank";
+            dbt.bankTxId = !t.bankTxId.empty()
+                    ? fallbackAccountId + ":" + t.bankTxId
+                    : fallbackAccountId + ":" + t.date + ":" + std::to_string(t.amount) + ":" + std::to_string(idx);
+            dbTransactions.push_back(dbt);
+            ++idx;
         }
 
         summary << " accounts_status=" << accountsResponse.statusCode
@@ -188,36 +268,17 @@ void AppServer::syncOnce(const std::string& reason) {
             << " transactions=" << transactions.size();
 
     if (db_) {
-        for (const auto& a : accounts) {
-            db::Account dba;
-            dba.id = "bank_acc_" + a.getName();
-            dba.name = a.getName();
-            dba.type = "bank";
-            dba.currency = "PLN";
-            dba.balance = a.getBalance(); // already in grosz
+        for (const auto& dba : dbAccounts) {
             db_->upsertAccount(dba);
         }
         int newTxCount = 0;
-        for (const auto& t : transactions) {
-            std::string bankTxId = t.name + "_" + t.date; // fallback dedup
-            if (!db_->txExists(bankTxId)) {
-                db::Transaction dbt;
-                dbt.id = db_->uuid();
-                dbt.accountId = "bank_acc_" + (accounts.empty() ? "unknown" : accounts.front().getName());
-                dbt.name = t.name;
-                dbt.description = t.opis;
-                dbt.amount = t.amount; // already in grosz
-                dbt.currency = "PLN";
-                dbt.fromParty = t.from;
-                dbt.toParty = t.to;
-                dbt.type = t.amount < 0 ? "expense" : "income";
-                dbt.category = "other";
-                dbt.date = t.date;
-                dbt.source = "bank";
-                dbt.bankTxId = bankTxId;
-                db_->insertTx(dbt);
-                newTxCount++;
+        for (auto& dbt : dbTransactions) {
+            if (db_->txExists(dbt.bankTxId)) {
+                continue;
             }
+            dbt.id = db_->uuid();
+            db_->insertTx(dbt);
+            ++newTxCount;
         }
         db::SyncRec rec;
         rec.syncedAt = db::Database::now();
@@ -231,6 +292,7 @@ void AppServer::syncOnce(const std::string& reason) {
     accounts_ = std::move(accounts);
     transactions_ = std::move(transactions);
     lastSyncSummary_ = summary.str();
+    lastSyncTime_ = db::Database::now();
     lastError_.clear();
 }
 
@@ -385,6 +447,13 @@ void AppServer::serve(int port) {
             break;
         }
 
+        // Guard against slow/stuck clients (Slowloris) blocking the accept loop.
+        timeval timeout{};
+        timeout.tv_sec = 15;
+        timeout.tv_usec = 0;
+        ::setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        ::setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
         const std::string rawRequest = readRequest(clientFd);
         const HttpRequest request = parseRequest(rawRequest);
         HttpResponse response;
@@ -423,11 +492,23 @@ std::string AppServer::readRequest(int clientFd) {
         if (!headersComplete && headerEnd != std::string::npos) {
             headersComplete = true;
             const std::string headers = request.substr(0, headerEnd);
-            const std::size_t contentLengthPos = headers.find("Content-Length:");
+            // Case-insensitive lookup of the Content-Length header.
+            const std::string lowered = lowerCopy(headers);
+            const std::size_t contentLengthPos = lowered.find("content-length:");
             if (contentLengthPos != std::string::npos) {
-                const std::size_t valueStart = contentLengthPos + std::strlen("Content-Length:");
+                const std::size_t valueStart = contentLengthPos + std::strlen("content-length:");
                 const std::size_t valueEnd = headers.find("\r\n", valueStart);
-                contentLength = static_cast<std::size_t>(std::stoul(trim(headers.substr(valueStart, valueEnd - valueStart))));
+                const std::string rawValue = trim(headers.substr(valueStart, valueEnd - valueStart));
+                // Validate the header instead of letting std::stoul throw on garbage.
+                errno = 0;
+                char* parseEnd = nullptr;
+                const unsigned long long parsed = std::strtoull(rawValue.c_str(), &parseEnd, 10);
+                constexpr unsigned long long kMaxBodyBytes = 8ULL * 1024ULL * 1024ULL;  // 8 MiB cap
+                if (parseEnd != rawValue.c_str() && errno == 0 && parsed <= kMaxBodyBytes) {
+                    contentLength = static_cast<std::size_t>(parsed);
+                } else {
+                    contentLength = 0;
+                }
             }
         }
         if (headersComplete) {
@@ -579,7 +660,7 @@ std::string AppServer::enumToString(my::type type) {
     switch (type) {
         case my::type::income: return "income";
         case my::type::expense: return "expense";
-        case my::type::inside: return "inside";
+        case my::type::inside: return "transfer";
     }
     return "expense";
 }
@@ -873,6 +954,11 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
         }
         return jsonResponse(200, out.str());
     }
+    if (request.method == "GET" && request.path == "/api/sync-status") {
+        if (!apiAuthorized(request)) return unauthorized("bad token");
+        return jsonResponse(200, renderSyncStatusJson());
+    }
+
     if (request.method == "GET" && request.path == "/api/accounts") {
         if (!apiAuthorized(request)) {
             return unauthorized(config_.apiToken.empty() ? "API token not configured" : "Unauthorized");
@@ -1218,6 +1304,29 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             if (!apiAuthorized(request)) return unauthorized("Unauthorized");
             int64_t id = std::strtoll(sid.c_str(), nullptr, 10);
             std::string suffix = pathSuffix("/api/db/savings/", sid);
+            if (suffix == "chart" && request.method == "GET") {
+                // Build the monthly progress chart from the goal's saved entries.
+                db::SavingsGoal goal;
+                for (const auto& g : db_->savingsGoals()) {
+                    if (g.id == id) { goal = g; break; }
+                }
+                auto entries = db_->savingsEntries(id);
+                std::ostringstream o;
+                o << "{\"id\":" << id << ",\"name\":" << jsonString(goal.name)
+                  << ",\"target\":" << goal.target << ",\"deadline\":" << jsonString(goal.deadline)
+                  << ",\"entries\":[";
+                int64_t cumulative = 0;
+                for (size_t j = 0; j < entries.size(); ++j) {
+                    if (j) o << ",";
+                    cumulative += entries[j].actual;
+                    o << "{\"year_month\":" << jsonString(entries[j].yearMonth)
+                      << ",\"planned\":" << entries[j].planned
+                      << ",\"actual\":" << entries[j].actual
+                      << ",\"cumulative\":" << cumulative << "}";
+                }
+                o << "]}";
+                return jsonResponse(200, o.str());
+            }
             if (suffix == "entry" && request.method == "PUT") {
                 db::SavingsEntry e; e.goalId = id; e.yearMonth = jf("year_month");
                 e.planned = ji("planned"); e.actual = ji("actual");
@@ -1348,6 +1457,18 @@ std::string AppServer::renderTransactionsJson() const {
         }
     }
     out << "]}";
+    return out.str();
+}
+
+std::string AppServer::renderSyncStatusJson() const {
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    std::ostringstream out;
+    out << "{";
+    out << "\"last_sync_time\":" << jsonString(lastSyncTime_) << ",";
+    out << "\"last_sync_summary\":" << jsonString(lastSyncSummary_) << ",";
+    out << "\"last_error\":" << jsonString(lastError_) << ",";
+    out << "\"sync_interval_seconds\":" << config_.syncIntervalSeconds;
+    out << "}";
     return out.str();
 }
 

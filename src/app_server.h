@@ -50,6 +50,7 @@ private:
     std::string lastAuthCode_;
     std::string lastWebhookPayload_;
     std::string lastSyncSummary_;
+    std::string lastSyncTime_;
     std::string lastError_;
 
     // Enable Banking session state — supports multiple banks
@@ -95,6 +96,7 @@ private:
     bool webhookSecretValid(const HttpRequest& request) const;
     std::string renderAccountsJson() const;
     std::string renderTransactionsJson() const;
+    std::string renderSyncStatusJson() const;
 };
 
 #endif //BANKSCONNECTAPP_APP_SERVER_H

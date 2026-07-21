@@ -326,12 +326,10 @@ StartAuthResult EnableBankingClient::startAuthorization(const std::string& state
     body += "\"psu_type\":\"" + jsonEscape(psuType) + "\"";
     body += "}";
 
-    std::cout << "[EB] POST /auth body: " << body << std::endl;
-
+    // Avoid logging the full request/response bodies (they carry auth material).
     const HttpResponse response = post("/auth", body);
 
-    std::cout << "[EB] POST /auth status: " << response.statusCode
-              << " body: " << response.body << std::endl;
+    std::cout << "[EB] POST /auth status: " << response.statusCode << std::endl;
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
         throw std::runtime_error("POST /auth failed (HTTP " + std::to_string(response.statusCode) + "): " + response.body);
@@ -351,12 +349,10 @@ StartAuthResult EnableBankingClient::startAuthorization(const std::string& state
 SessionResult EnableBankingClient::createSession(const std::string& code) const {
     const std::string body = "{\"code\":\"" + jsonEscape(code) + "\"}";
 
-    std::cout << "[EB] POST /sessions body: " << body << std::endl;
-
+    // Do not log the authorization code or the response body (contains session id).
     const HttpResponse response = post("/sessions", body);
 
-    std::cout << "[EB] POST /sessions status: " << response.statusCode
-              << " body: " << response.body << std::endl;
+    std::cout << "[EB] POST /sessions status: " << response.statusCode << std::endl;
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
         throw std::runtime_error("POST /sessions failed (HTTP " + std::to_string(response.statusCode) + "): " + response.body);
@@ -427,6 +423,11 @@ HttpResponse EnableBankingClient::request(const std::string& method, const std::
     std::vector<std::string> args;
     args.emplace_back("curl");
     args.emplace_back("-sS");
+    // Bound the request so a hung upstream can't block sync indefinitely.
+    args.emplace_back("--connect-timeout");
+    args.emplace_back("10");
+    args.emplace_back("--max-time");
+    args.emplace_back("30");
     args.emplace_back("-X");
     args.emplace_back(method);
     args.emplace_back("-w");

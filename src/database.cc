@@ -108,13 +108,24 @@ std::vector<Account> Database::accounts()const{
 }
 
 void Database::upsertAccount(const Account& a){
-    exec("INSERT INTO accounts(id,name,type,currency,bank_name,iban,balance,created_at,updated_at)"
-         "VALUES("+q(a.id)+","+q(a.name)+","+q(a.type)+","+q(a.currency)+","
-         +q(a.bankName)+","+q(a.iban)+","+std::to_string(a.balance)+","
-         +q(a.createdAt.empty()?now():a.createdAt)+","+q(now())+")"
-         " ON CONFLICT(id) DO UPDATE SET name=excluded.name,type=excluded.type,"
-         "currency=excluded.currency,bank_name=excluded.bank_name,iban=excluded.iban,"
-         "balance=excluded.balance,updated_at=excluded.updated_at");
+    // Parameterized to safely handle bank-provided strings.
+    static const char* sql=
+        "INSERT INTO accounts(id,name,type,currency,bank_name,iban,balance,created_at,updated_at)"
+        "VALUES(?,?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(id) DO UPDATE SET name=excluded.name,type=excluded.type,"
+        "currency=excluded.currency,bank_name=excluded.bank_name,iban=excluded.iban,"
+        "balance=excluded.balance,updated_at=excluded.updated_at";
+    sqlite3_stmt* st=nullptr;
+    if(sqlite3_prepare_v2(db_,sql,-1,&st,nullptr)!=SQLITE_OK)
+        throw std::runtime_error(std::string("prepare upsertAccount: ")+sqlite3_errmsg(db_));
+    const std::string created=a.createdAt.empty()?now():a.createdAt;
+    const std::string updated=now();
+    auto bt=[&](int i,const std::string& v){sqlite3_bind_text(st,i,v.c_str(),-1,SQLITE_TRANSIENT);};
+    bt(1,a.id);bt(2,a.name);bt(3,a.type);bt(4,a.currency);bt(5,a.bankName);bt(6,a.iban);
+    sqlite3_bind_int64(st,7,a.balance);bt(8,created);bt(9,updated);
+    const int rc=sqlite3_step(st);
+    sqlite3_finalize(st);
+    if(rc!=SQLITE_DONE)throw std::runtime_error(std::string("upsertAccount step: ")+sqlite3_errmsg(db_));
 }
 
 void Database::deleteAccount(const std::string& id){exec("DELETE FROM accounts WHERE id="+q(id));}
@@ -152,12 +163,24 @@ Transaction Database::transaction(const std::string& id)const{
 }
 
 void Database::insertTx(const Transaction& t){
-    exec("INSERT OR IGNORE INTO transactions(id,account_id,name,description,amount,currency,"
+    // Parameterized to safely handle bank-provided strings.
+    static const char* sql=
+        "INSERT OR IGNORE INTO transactions(id,account_id,name,description,amount,currency,"
         "from_party,to_party,type,category,tag,date,source,bank_tx_id,parent_id,created_at,updated_at)"
-        "VALUES("+q(t.id)+","+q(t.accountId)+","+q(t.name)+","+q(t.description)+","
-        +std::to_string(t.amount)+","+q(t.currency)+","+q(t.fromParty)+","+q(t.toParty)+","
-        +q(t.type)+","+q(t.category)+","+q(t.tag)+","+q(t.date)+","+q(t.source)+","
-        +q(t.bankTxId)+","+q(t.parentId)+","+q(t.createdAt.empty()?now():t.createdAt)+","+q(now())+")");
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+    sqlite3_stmt* st=nullptr;
+    if(sqlite3_prepare_v2(db_,sql,-1,&st,nullptr)!=SQLITE_OK)
+        throw std::runtime_error(std::string("prepare insertTx: ")+sqlite3_errmsg(db_));
+    const std::string created=t.createdAt.empty()?now():t.createdAt;
+    const std::string updated=now();
+    auto bt=[&](int i,const std::string& v){sqlite3_bind_text(st,i,v.c_str(),-1,SQLITE_TRANSIENT);};
+    bt(1,t.id);bt(2,t.accountId);bt(3,t.name);bt(4,t.description);
+    sqlite3_bind_int64(st,5,t.amount);bt(6,t.currency);bt(7,t.fromParty);bt(8,t.toParty);
+    bt(9,t.type);bt(10,t.category);bt(11,t.tag);bt(12,t.date);bt(13,t.source);
+    bt(14,t.bankTxId);bt(15,t.parentId);bt(16,created);bt(17,updated);
+    const int rc=sqlite3_step(st);
+    sqlite3_finalize(st);
+    if(rc!=SQLITE_DONE)throw std::runtime_error(std::string("insertTx step: ")+sqlite3_errmsg(db_));
 }
 
 void Database::updateTx(const std::string& id,const Transaction& u){

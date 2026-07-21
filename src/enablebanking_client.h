@@ -18,7 +18,7 @@ struct EnableBankingConfig {
     std::string jwtIssuer;
     std::string jwtAudience;
     int jwtTtlSeconds = 3600;
-    int syncIntervalSeconds = 300;
+    int syncIntervalSeconds = 21600; // 6 hours default
     bool enforceHttps = true;
     bool addHsts = true;
     bool allowInsecureHttp = false;
