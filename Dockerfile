@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     curl \
     openssl \
+    libssl-dev \
     pkg-config \
     libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*

@@ -280,11 +280,12 @@ std::vector<trans> parseTransactions(const std::string& json) {
         }
         std::string indicator = extractStringValue(object, "credit_debit_indicator");
         if (indicator.empty()) indicator = extractStringValue(object, "creditDebitIndicator");
+        if (indicator.empty()) indicator = extractStringValue(object, "type");
         std::transform(indicator.begin(), indicator.end(), indicator.begin(),
                        [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
-        if (indicator == "DBIT" && amountMinor > 0) {
+        if ((indicator == "DBIT" || indicator == "EXPENSE") && amountMinor > 0) {
             amountMinor = -amountMinor;
-        } else if (indicator == "CRDT" && amountMinor < 0) {
+        } else if ((indicator == "CRDT" || indicator == "INCOME") && amountMinor < 0) {
             amountMinor = -amountMinor;
         }
 
@@ -305,6 +306,8 @@ std::vector<trans> parseTransactions(const std::string& json) {
         if (transaction.date.empty()) transaction.date = extractStringValue(object, "valueDate");
         if (transaction.date.empty()) transaction.date = extractStringValue(object, "transactionDate");
         if (transaction.date.empty()) transaction.date = extractStringValue(object, "date");
+        if (transaction.date.empty()) transaction.date = extractStringValue(object, "timestamp");
+        if (transaction.date.empty()) transaction.date = extractStringValue(object, "created_at");
         // Trim any time component (keep YYYY-MM-DD).
         if (transaction.date.size() > 10) {
             transaction.date = transaction.date.substr(0, 10);

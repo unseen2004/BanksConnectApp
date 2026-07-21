@@ -223,16 +223,35 @@ void AppServer::syncOnce(const std::string& reason) {
 
         accounts = parseAccounts(accountsResponse.body);
         transactions = parseTransactions(transactionsResponse.body);
+        BankBalance genericBalance = parseBalance(balancesResponse.body);
 
         const std::string fallbackAccountId = accounts.empty() ? "unknown" : accounts.front().getName();
         const std::string dbAccountId = "bank_acc_" + fallbackAccountId;
-        for (const auto& a : accounts) {
+        for (auto& a : accounts) {
             db::Account dba;
             dba.id = "bank_acc_" + a.getName();
             dba.name = a.getName();
             dba.type = "bank";
             dba.currency = "PLN";
+            
+            // Try extracting bankName from generic JSON body
+            std::size_t nPos = accountsResponse.body.find("\"bank_name\"");
+            if (nPos == std::string::npos) nPos = accountsResponse.body.find("\"bankName\"");
+            if (nPos != std::string::npos) {
+                std::size_t col = accountsResponse.body.find(':', nPos);
+                std::size_t val = accountsResponse.body.find('"', col);
+                if (val != std::string::npos) {
+                    std::size_t end = accountsResponse.body.find('"', val + 1);
+                    if (end != std::string::npos) dba.bankName = accountsResponse.body.substr(val + 1, end - val - 1);
+                }
+            }
+            if (dba.bankName.empty()) dba.bankName = "Enable Banking Proxy";
+            
             dba.balance = a.getBalance();
+            if (dba.balance == 0 && genericBalance.found) {
+                dba.balance = genericBalance.minorUnits;
+                a.setBalance(genericBalance.minorUnits);
+            }
             dbAccounts.push_back(dba);
         }
         int idx = 0;
