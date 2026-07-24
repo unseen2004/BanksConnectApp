@@ -495,6 +495,7 @@ std::string AppServer::readRequest(int clientFd) {
     std::size_t contentLength = 0;
     bool headersComplete = false;
 
+    constexpr std::size_t kMaxRequestBytes = 8ULL * 1024ULL * 1024ULL; // 8 MiB total cap
     while (true) {
         const ssize_t bytesRead = ::recv(clientFd, buffer, sizeof(buffer), 0);
         if (bytesRead < 0) {
@@ -507,6 +508,9 @@ std::string AppServer::readRequest(int clientFd) {
             break;
         }
         request.append(buffer, static_cast<std::size_t>(bytesRead));
+        if (request.size() > kMaxRequestBytes) {
+            break; // prevent OOM from oversized requests
+        }
         const std::size_t headerEnd = request.find("\r\n\r\n");
         if (!headersComplete && headerEnd != std::string::npos) {
             headersComplete = true;
@@ -803,6 +807,11 @@ AppServer::HttpResponse AppServer::jsonResponse(int status, const std::string& b
 }
 
 AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
+    if (config_.debugMode) {
+        std::cout << "[DEBUG] AppServer handling request: " << request.method << " " << request.path << "\n";
+        std::cout << "[DEBUG] Query: " << request.query << "\n";
+    }
+
     const auto query = parseQuery(request.query);
 
     if (request.method == "GET" && request.path == "/health") {
@@ -1087,6 +1096,10 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             std::string from = query.count("from") ? query.at("from") : "";
             std::string to = query.count("to") ? query.at("to") : "";
             auto txs = db_->transactions(acct, from, to);
+            auto accs = db_->accounts();
+            std::map<std::string, std::string> bankNames;
+            for (const auto& a : accs) bankNames[a.id] = a.bankName;
+
             std::ostringstream o; o << "[";
             for (size_t i = 0; i < txs.size(); ++i) {
                 if (i) o << ",";
@@ -1094,6 +1107,7 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                 auto subs = db_->subTx(t.id);
                 auto edits = db_->txHistory(t.id);
                 o << "{\"id\":" << jsonString(t.id) << ",\"account_id\":" << jsonString(t.accountId)
+                  << ",\"bank_name\":" << jsonString(bankNames[t.accountId])
                   << ",\"name\":" << jsonString(t.name) << ",\"description\":" << jsonString(t.description)
                   << ",\"amount\":" << t.amount << ",\"currency\":" << jsonString(t.currency)
                   << ",\"from\":" << jsonString(t.fromParty) << ",\"to\":" << jsonString(t.toParty)

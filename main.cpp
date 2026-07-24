@@ -154,6 +154,10 @@ std::string materializePrivateKeyPath() {
     }
     ::close(fd);
     ::chmod(path, 0600);
+    // Clean up temp key file on exit so it doesn't persist.
+    static std::string tempKeyPath;
+    tempKeyPath = path;
+    std::atexit([]() { if (!tempKeyPath.empty()) ::unlink(tempKeyPath.c_str()); });
     return std::string(path);
 }
 
@@ -161,7 +165,7 @@ void printUsage() {
     std::cout
             << "Usage:\n"
             << "  BanksConnectApp --auth-url [state] [scope]\n"
-            << "  BanksConnectApp\n\n"
+            << "  BanksConnectApp [--debug]\n\n"
             << "Environment:\n"
             << "  PORT\n"
             << "  ENABLEBANKING_BASE_URL\n"
@@ -268,18 +272,68 @@ EnableBankingConfig loadConfig() {
 }
 }
 
-int main(int argc, char** argv) {
-    try {
-        const EnableBankingConfig config = loadConfig();
+class TeeStreamBuf : public std::streambuf {
+public:
+    TeeStreamBuf(std::streambuf* stream1, std::streambuf* stream2)
+        : stream1_(stream1), stream2_(stream2) {}
+protected:
+    virtual int overflow(int c) override {
+        if (c == EOF) {
+            return !EOF;
+        } else {
+            int const r1 = stream1_->sputc(c);
+            int const r2 = stream2_->sputc(c);
+            return r1 == EOF || r2 == EOF ? EOF : c;
+        }
+    }
+    virtual int sync() override {
+        int const r1 = stream1_->pubsync();
+        int const r2 = stream2_->pubsync();
+        return r1 == 0 && r2 == 0 ? 0 : -1;
+    }
+private:
+    std::streambuf* stream1_;
+    std::streambuf* stream2_;
+};
 
-        if (argc > 1 && std::string(argv[1]) == "--help") {
+int main(int argc, char** argv) {
+    std::ofstream logFile;
+    TeeStreamBuf* teeOut = nullptr;
+    TeeStreamBuf* teeErr = nullptr;
+    std::streambuf* oldOut = std::cout.rdbuf();
+    std::streambuf* oldErr = std::cerr.rdbuf();
+
+    try {
+        EnableBankingConfig config = loadConfig();
+        
+        std::vector<std::string> args;
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--debug") {
+                config.debugMode = true;
+            } else {
+                args.push_back(argv[i]);
+            }
+        }
+
+        if (config.debugMode) {
+            logFile.open("banksconnect.log", std::ios::app);
+            if (logFile.is_open()) {
+                teeOut = new TeeStreamBuf(oldOut, logFile.rdbuf());
+                teeErr = new TeeStreamBuf(oldErr, logFile.rdbuf());
+                std::cout.rdbuf(teeOut);
+                std::cerr.rdbuf(teeErr);
+                std::cout << "[DEBUG] Debug mode enabled. Output is logged to banksconnect.log" << std::endl;
+            }
+        }
+
+        if (args.size() > 0 && args[0] == "--help") {
             printUsage();
             return 0;
         }
 
-        if (argc > 1 && std::string(argv[1]) == "--auth-url") {
-            const std::string state = argc > 2 ? argv[2] : "railway-state";
-            const std::string scope = argc > 3 ? argv[3] : "accounts transactions balances";
+        if (args.size() > 0 && args[0] == "--auth-url") {
+            const std::string state = args.size() > 1 ? args[1] : "railway-state";
+            const std::string scope = args.size() > 2 ? args[2] : "accounts transactions balances";
             EnableBankingClient client(config);
             std::cout << client.authorizationUrl(state, scope) << std::endl;
             return 0;
@@ -287,10 +341,16 @@ int main(int argc, char** argv) {
 
         AppServer server(config);
         server.run();
+
+        if (teeOut) delete teeOut;
+        if (teeErr) delete teeErr;
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << std::endl;
         printUsage();
+        if (teeOut) delete teeOut;
+        if (teeErr) delete teeErr;
         return 1;
     }
 }
+

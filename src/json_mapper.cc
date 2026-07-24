@@ -255,12 +255,13 @@ std::vector<trans> parseTransactions(const std::string& json) {
         // Counterparty objects (Enable Banking nests these under creditor/debtor).
         const std::string creditor = extractObject(object, "creditor");
         const std::string debtor = extractObject(object, "debtor");
-        const std::string creditorName = !creditor.empty()
-                ? extractStringValue(creditor, "name")
-                : extractStringValue(object, "creditorName");
-        const std::string debtorName = !debtor.empty()
-                ? extractStringValue(debtor, "name")
-                : extractStringValue(object, "debtorName");
+        std::string creditorName = !creditor.empty() ? extractStringValue(creditor, "name") : "";
+        if (creditorName.empty()) creditorName = extractStringValue(object, "creditorName");
+        if (creditorName.empty()) creditorName = extractStringValue(object, "creditor_name");
+
+        std::string debtorName = !debtor.empty() ? extractStringValue(debtor, "name") : "";
+        if (debtorName.empty()) debtorName = extractStringValue(object, "debtorName");
+        if (debtorName.empty()) debtorName = extractStringValue(object, "debtor_name");
 
         // Remittance information: snake_case array, then legacy fields.
         std::string remittance = joinStringArray(findArrayBody(object, "remittance_information"));
@@ -308,10 +309,6 @@ std::vector<trans> parseTransactions(const std::string& json) {
         if (transaction.date.empty()) transaction.date = extractStringValue(object, "date");
         if (transaction.date.empty()) transaction.date = extractStringValue(object, "timestamp");
         if (transaction.date.empty()) transaction.date = extractStringValue(object, "created_at");
-        // Trim any time component (keep YYYY-MM-DD).
-        if (transaction.date.size() > 10) {
-            transaction.date = transaction.date.substr(0, 10);
-        }
 
         transaction.opis = remittance;
         if (transaction.opis.empty()) transaction.opis = extractStringValue(object, "description");

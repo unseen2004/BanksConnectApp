@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <utility>
 
-accInvest::accInvest(std::string name, int balance) : acc(std::move(name), balance) {}
+accInvest::accInvest(std::string name, int64_t balance) : acc(std::move(name), balance) {}
 
 void accInvest::addInvestment(const investAsset& investment) {
     investments.push_back(investment);

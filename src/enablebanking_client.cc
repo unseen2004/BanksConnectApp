@@ -451,6 +451,14 @@ HttpResponse EnableBankingClient::request(const std::string& method, const std::
     }
     argv.push_back(nullptr);
 
+    if (config_.debugMode) {
+        std::cout << "[DEBUG] Executing curl: ";
+        for (const auto& arg : args) {
+            std::cout << arg << " ";
+        }
+        std::cout << std::endl;
+    }
+
     const pid_t pid = ::fork();
     if (pid < 0) {
         ::close(pipefd[0]);
@@ -486,5 +494,11 @@ HttpResponse EnableBankingClient::request(const std::string& method, const std::
         response.body = output;
         response.statusCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     }
+    
+    if (config_.debugMode) {
+        std::cout << "[DEBUG] curl response (status: " << response.statusCode << ", length: " << output.size() << "):\n";
+        std::cout << output.substr(0, 2000) << (output.size() > 2000 ? "\n... (truncated)" : "") << std::endl;
+    }
+    
     return response;
 }

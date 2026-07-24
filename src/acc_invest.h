@@ -8,8 +8,8 @@
 
 struct investAsset {
     std::string name;
-    int amount_start;
-    int amount_end;
+    int64_t amount_start;
+    int64_t amount_end;
     std::string date_start;
     std::string date_end;
 };
@@ -18,7 +18,7 @@ class accInvest : public acc {
     std::vector<investAsset> investments;
 
 public:
-    accInvest(std::string name, int balance);
+    accInvest(std::string name, int64_t balance);
     void addInvestment(const investAsset& investment);
     void deleteInvestment(const std::string& investmentName);
     const std::vector<investAsset>& getInvestments() const;

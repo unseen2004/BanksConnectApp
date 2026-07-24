@@ -33,7 +33,12 @@ WORKDIR /app
 
 COPY --from=build /app/build/BanksConnectApp /usr/local/bin/BanksConnectApp
 
+RUN useradd -m app && mkdir -p /app/data && chown app:app /app/data
+USER app
+
 ENV PORT=8080
+ENV ENABLEBANKING_DATA_DIR=/app/data
 EXPOSE 8080
+VOLUME /app/data
 
 CMD ["BanksConnectApp"]
