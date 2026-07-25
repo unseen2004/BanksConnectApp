@@ -1,11 +1,14 @@
 #include "app_server.h"
 #include "enablebanking_client.h"
 
+#include <csignal>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <string>
+#include <vector>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -125,40 +128,29 @@ std::string base64Decode(const std::string& input) {
     return output;
 }
 
-std::string materializePrivateKeyPath() {
-    const std::string existingPath = envOrEmpty("ENABLEBANKING_PRIVATE_KEY_PATH");
-    if (!existingPath.empty()) {
-        return existingPath;
-    }
-
-    std::string pem = envOrEmpty("ENABLEBANKING_PRIVATE_KEY_PEM");
-    if (pem.empty()) {
-        const std::string pemB64 = envOrEmpty("ENABLEBANKING_PRIVATE_KEY_PEM_B64");
-        if (!pemB64.empty()) {
-            pem = base64Decode(pemB64);
+// Returns the signing key as PEM text. The key is kept in memory only: it used to
+// be written to a temp file in /tmp so the openssl CLI could read it, which left
+// the private key on disk for the lifetime of the process and leaked it entirely
+// if the process was killed before its atexit handler ran.
+std::string loadPrivateKeyPem() {
+    const std::string keyPath = envOrEmpty("ENABLEBANKING_PRIVATE_KEY_PATH");
+    if (!keyPath.empty()) {
+        std::ifstream keyFile(keyPath, std::ios::binary);
+        if (!keyFile) {
+            throw std::runtime_error("Cannot read ENABLEBANKING_PRIVATE_KEY_PATH: " + keyPath);
         }
-    }
-    if (pem.empty()) {
-        return std::string();
+        return std::string((std::istreambuf_iterator<char>(keyFile)), std::istreambuf_iterator<char>());
     }
 
-    char path[] = "/tmp/enablebanking-private-key-XXXXXX";
-    const int fd = mkstemp(path);
-    if (fd < 0) {
-        throw std::runtime_error("Failed to create temporary private key file");
+    const std::string pem = envOrEmpty("ENABLEBANKING_PRIVATE_KEY_PEM");
+    if (!pem.empty()) {
+        return pem;
     }
-    const ssize_t written = ::write(fd, pem.data(), pem.size());
-    if (written != static_cast<ssize_t>(pem.size())) {
-        ::close(fd);
-        throw std::runtime_error("Failed to write temporary private key file");
+    const std::string pemB64 = envOrEmpty("ENABLEBANKING_PRIVATE_KEY_PEM_B64");
+    if (!pemB64.empty()) {
+        return base64Decode(pemB64);
     }
-    ::close(fd);
-    ::chmod(path, 0600);
-    // Clean up temp key file on exit so it doesn't persist.
-    static std::string tempKeyPath;
-    tempKeyPath = path;
-    std::atexit([]() { if (!tempKeyPath.empty()) ::unlink(tempKeyPath.c_str()); });
-    return std::string(path);
+    return std::string();
 }
 
 void printUsage() {
@@ -190,6 +182,8 @@ void printUsage() {
             << "  ENABLEBANKING_WEBHOOK_SECRET\n"
             << "  ENABLEBANKING_WEBHOOK_SECRET_HEADER\n"
             << "  ENABLEBANKING_SYNC_INTERVAL_SECONDS\n"
+            << "  ENABLEBANKING_HTTP_TIMEOUT_SECONDS\n"
+            << "  ENABLEBANKING_RATE_LIMIT_PER_MINUTE\n"
             << "  ENABLEBANKING_AUTHORIZE_PATH\n"
             << "  ENABLEBANKING_CONSENT_PATH\n"
             << "  ENABLEBANKING_ACCOUNTS_PATH\n"
@@ -199,7 +193,8 @@ void printUsage() {
             << "  ENABLEBANKING_ASPSP_COUNTRY\n"
             << "  ENABLEBANKING_PSU_TYPE\n"
             << "  ENABLEBANKING_CONSENT_VALID_DAYS\n"
-            << "  ENABLEBANKING_DATA_DIR\n";
+            << "  ENABLEBANKING_DATA_DIR\n"
+            << "  ENABLEBANKING_TRUST_PROXY_HEADERS (set only when behind a reverse proxy)\n";
 }
 
 EnableBankingConfig loadConfig() {
@@ -212,15 +207,19 @@ EnableBankingConfig loadConfig() {
     config.webhookSecretHeader = envOrEmpty("ENABLEBANKING_WEBHOOK_SECRET_HEADER");
     config.accessToken = envOrEmpty("ENABLEBANKING_ACCESS_TOKEN");
     config.apiToken = envOrEmpty("ENABLEBANKING_API_TOKEN");
-    config.privateKeyPath = materializePrivateKeyPath();
+    config.privateKeyPath = envOrEmpty("ENABLEBANKING_PRIVATE_KEY_PATH");
+    config.privateKeyPem = loadPrivateKeyPem();
     config.appCode = envOrEmpty("ENABLEBANKING_APP_CODE");
     config.jwtIssuer = envOrEmpty("ENABLEBANKING_JWT_ISSUER");
     config.jwtAudience = envOrEmpty("ENABLEBANKING_JWT_AUDIENCE");
     config.jwtTtlSeconds = envOrInt("ENABLEBANKING_JWT_TTL_SECONDS", 3600);
     config.syncIntervalSeconds = envOrInt("ENABLEBANKING_SYNC_INTERVAL_SECONDS", 300);
+    config.httpTimeoutSeconds = envOrInt("ENABLEBANKING_HTTP_TIMEOUT_SECONDS", 30);
+    config.rateLimitPerMinute = envOrInt("ENABLEBANKING_RATE_LIMIT_PER_MINUTE", 60);
     config.enforceHttps = envOrBool("ENABLEBANKING_ENFORCE_HTTPS", true);
     config.addHsts = envOrBool("ENABLEBANKING_ADD_HSTS", true);
     config.allowInsecureHttp = envOrBool("ENABLEBANKING_ALLOW_INSECURE_HTTP", false);
+    config.trustProxyHeaders = envOrBool("ENABLEBANKING_TRUST_PROXY_HEADERS", false);
     config.authorizePath = envOrEmpty("ENABLEBANKING_AUTHORIZE_PATH");
     config.consentPath = envOrEmpty("ENABLEBANKING_CONSENT_PATH");
     config.accountsPath = envOrEmpty("ENABLEBANKING_ACCOUNTS_PATH");
@@ -271,6 +270,33 @@ EnableBankingConfig loadConfig() {
     return config;
 }
 }
+
+namespace {
+AppServer* g_serverForShutdown = nullptr;
+
+extern "C" void handleShutdownSignal(int) {
+    // Only async-signal-safe work happens here; requestShutdown() closes the
+    // listening socket so the accept loop can unwind and flush state normally.
+    if (g_serverForShutdown != nullptr) {
+        g_serverForShutdown->requestShutdown();
+    }
+}
+
+void installShutdownHandler(AppServer& server) {
+    g_serverForShutdown = &server;
+    struct sigaction action{};
+    action.sa_handler = handleShutdownSignal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;  // no SA_RESTART: accept() should return EINTR
+    ::sigaction(SIGINT, &action, nullptr);
+    ::sigaction(SIGTERM, &action, nullptr);
+
+    // Writing to a closed client socket must not kill the process.
+    struct sigaction ignore{};
+    ignore.sa_handler = SIG_IGN;
+    ::sigaction(SIGPIPE, &ignore, nullptr);
+}
+}  // namespace
 
 class TeeStreamBuf : public std::streambuf {
 public:
@@ -342,6 +368,7 @@ int main(int argc, char** argv) {
         }
 
         AppServer server(config);
+        installShutdownHandler(server);
         server.run();
 
         if (teeOut) {

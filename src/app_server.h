@@ -7,6 +7,9 @@
 #include "trans.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -21,14 +24,21 @@ public:
 
     void run();
 
+    // Signals the accept loop to stop; safe to call from a signal handler.
+    void requestShutdown();
+
 private:
     struct HttpRequest {
         std::string method;
         std::string target;
         std::string path;
         std::string query;
+        // Header names are normalised to lower case, since HTTP header names are
+        // case-insensitive. Always look up with a lower-case key.
         std::map<std::string, std::string> headers;
         std::string body;
+        std::string clientIp;
+        bool unsupportedTransferEncoding = false;
     };
 
     struct HttpResponse {
@@ -65,8 +75,28 @@ private:
     std::string pendingAuthAspsp_;    // ASPSP name for the auth flow in progress
     std::string pendingAuthCountry_;  // country for the auth flow in progress
 
+    // Sync is always performed on syncThread_; request handlers only enqueue a
+    // wake-up so that a slow upstream can never stall an HTTP response.
+    std::mutex syncWakeMutex_;
+    std::condition_variable syncWake_;
+    bool syncRequested_ = false;
+    std::string syncRequestReason_;
+    std::atomic<bool> syncInProgress_{false};
+
+    // Fixed-window rate limiter for unauthenticated / credential-checking routes.
+    struct RateWindow {
+        std::chrono::steady_clock::time_point windowStart;
+        int count = 0;
+    };
+    std::mutex rateMutex_;
+    std::map<std::string, RateWindow> rateWindows_;
+
+    int listenFd_ = -1;
+
     void startSyncLoop();
     void syncOnce(const std::string& reason);
+    void requestSync(const std::string& reason);
+    bool rateLimitExceeded(const std::string& bucket);
     void saveSessions() const;
     void loadSessions();
     void serve(int port);
@@ -81,7 +111,7 @@ private:
     std::string generateStateToken() const;
     static HttpRequest parseRequest(const std::string& rawRequest);
     static std::string readRequest(int clientFd);
-    static std::string buildResponse(const HttpResponse& response);
+    std::string buildResponse(const HttpResponse& response) const;
     static std::string decodeUrl(const std::string& value);
     static std::map<std::string, std::string> parseQuery(const std::string& query);
     static std::string htmlEscape(const std::string& value);

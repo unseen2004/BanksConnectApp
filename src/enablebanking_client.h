@@ -14,14 +14,24 @@ struct EnableBankingConfig {
     std::string accessToken;
     std::string apiToken;
     std::string privateKeyPath;
+    // PEM contents of the signing key, held in memory so the key never has to be
+    // materialised into a world-readable temp file for the openssl CLI.
+    std::string privateKeyPem;
     std::string appCode;
     std::string jwtIssuer;
     std::string jwtAudience;
     int jwtTtlSeconds = 3600;
     int syncIntervalSeconds = 21600; // 6 hours default
+    int httpTimeoutSeconds = 30;     // upstream request timeout
+    int rateLimitPerMinute = 60;     // per-IP cap on credential-checking routes
     bool enforceHttps = true;
     bool addHsts = true;
     bool allowInsecureHttp = false;
+    // Whether X-Forwarded-Proto / Forwarded / X-Forwarded-Ssl may be believed.
+    // Off by default: any client can set them, so trusting them unconditionally
+    // lets a caller claim a plaintext connection is secure. Only enable when a
+    // reverse proxy in front of this server overwrites them on every request.
+    bool trustProxyHeaders = false;
     std::string authorizePath;
     std::string consentPath;
     std::string accountsPath;
@@ -103,7 +113,7 @@ private:
     static std::string urlEncode(const std::string& value);
     static std::string base64UrlEncode(const unsigned char* data, std::size_t size);
     static std::string base64UrlEncode(const std::string& value);
-    static std::string signWithOpenSsl(const std::string& message, const std::string& privateKeyPath);
+    static std::string signRs256(const std::string& message, const std::string& privateKeyPem);
     static std::string jsonEscapeStatic(const std::string& value);
 };
 

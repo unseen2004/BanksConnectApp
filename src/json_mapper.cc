@@ -1,13 +1,13 @@
 #include "json_mapper.h"
 
+#include "money.h"
+
 #include <algorithm>
 #include <cctype>
-#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <iostream>
 #include <limits>
-#include <locale>
-#include <sstream>
 #include <string>
 
 namespace {
@@ -112,7 +112,14 @@ std::vector<std::string> splitObjects(const std::string& jsonArray) {
     return objects;
 }
 
-std::string findArrayBody(const std::string& json, const std::string& key) {
+/// Locates the body of a JSON array by key. `found` distinguishes "the key is not
+/// present" from "the key holds an empty array" — collapsing the two made an empty
+/// array fall back to scanning the whole document, which turned `{"transactions":[]}`
+/// into one phantom transaction.
+std::string findArrayBody(const std::string& json, const std::string& key, bool* found = nullptr) {
+    if (found != nullptr) {
+        *found = false;
+    }
     const std::string pattern = "\"" + key + "\"";
     const std::size_t keyPos = json.find(pattern);
     if (keyPos == std::string::npos) {
@@ -121,6 +128,9 @@ std::string findArrayBody(const std::string& json, const std::string& key) {
     const std::size_t bracketStart = json.find('[', keyPos + pattern.size());
     if (bracketStart == std::string::npos) {
         return std::string();
+    }
+    if (found != nullptr) {
+        *found = true;
     }
     int depth = 0;
     bool inString = false;
@@ -174,13 +184,14 @@ int64_t parseAmountToMinor(const std::string& value) {
     if (value.empty()) {
         return 0;
     }
-    std::istringstream stream(value);
-    stream.imbue(std::locale::classic());
-    double parsed = 0.0;
-    if (!(stream >> parsed)) {
+    int64_t minor = 0;
+    if (!money::parseToMinor(value, minor)) {
+        // Silently treating this as 0.00 would understate a balance, so make the
+        // rejected value visible in the logs.
+        std::cerr << "[warn] could not parse amount as decimal: " << value << std::endl;
         return 0;
     }
-    return static_cast<int64_t>(std::llround(parsed * 100.0));
+    return minor;
 }
 
 my::currency parseCurrency(const std::string& value) {
@@ -213,8 +224,9 @@ void extractAmount(const std::string& object, const std::string& nestedKey,
 }  // namespace
 
 std::vector<acc> parseAccounts(const std::string& json) {
-    std::string body = findArrayBody(json, "accounts");
-    if (body.empty()) {
+    bool hasAccountsKey = false;
+    std::string body = findArrayBody(json, "accounts", &hasAccountsKey);
+    if (!hasAccountsKey) {
         body = json;
     }
     const std::vector<std::string> objects = splitObjects(body);
@@ -242,8 +254,9 @@ std::vector<acc> parseAccounts(const std::string& json) {
 }
 
 std::vector<trans> parseTransactions(const std::string& json) {
-    std::string body = findArrayBody(json, "transactions");
-    if (body.empty()) {
+    bool hasTransactionsKey = false;
+    std::string body = findArrayBody(json, "transactions", &hasTransactionsKey);
+    if (!hasTransactionsKey) {
         body = json;
     }
     const std::vector<std::string> objects = splitObjects(body);
@@ -336,6 +349,13 @@ std::vector<trans> parseTransactions(const std::string& json) {
         if (transaction.bankTxId.empty()) transaction.bankTxId = extractStringValue(object, "entryReference");
         if (transaction.bankTxId.empty()) transaction.bankTxId = extractStringValue(object, "transactionId");
 
+        // An object carrying none of these is not a transaction — an unrecognised
+        // envelope would otherwise be stored as a zero-amount, dateless row.
+        if (transaction.date.empty() && amountMinor == 0 && transaction.bankTxId.empty() &&
+            transaction.name.empty()) {
+            continue;
+        }
+
         transactions.push_back(transaction);
     }
     return transactions;
@@ -392,4 +412,22 @@ BankAccountDetails parseAccountDetails(const std::string& json) {
         details.iban = extractStringValue(json, "iban");
     }
     return details;
+}
+
+std::string jsonExtractString(const std::string& object, const std::string& key) {
+    return extractStringValue(object, key);
+}
+
+int64_t jsonExtractInt64(const std::string& object, const std::string& key) {
+    const std::string raw = extractStringValue(object, key);
+    if (raw.empty()) return 0;
+    return std::strtoll(raw.c_str(), nullptr, 10);
+}
+
+std::vector<std::string> jsonSplitObjects(const std::string& jsonArray) {
+    return splitObjects(jsonArray);
+}
+
+std::string jsonFindArrayBody(const std::string& json, const std::string& key) {
+    return findArrayBody(json, key, nullptr);
 }

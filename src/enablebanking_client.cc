@@ -1,5 +1,6 @@
 #include "enablebanking_client.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -13,6 +14,7 @@
 #include <sstream>
 #include <utility>
 #include <vector>
+#include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/err.h>
@@ -204,12 +206,15 @@ std::string EnableBankingClient::base64UrlEncode(const std::string& value) {
     return base64UrlEncode(reinterpret_cast<const unsigned char*>(value.data()), value.size());
 }
 
-std::string EnableBankingClient::signWithOpenSsl(const std::string& message, const std::string& privateKeyPath) {
-    FILE* keyFile = fopen(privateKeyPath.c_str(), "r");
-    if (!keyFile) throw std::runtime_error("Could not open private key file: " + privateKeyPath);
-    EVP_PKEY* pkey = PEM_read_PrivateKey(keyFile, nullptr, nullptr, nullptr);
-    fclose(keyFile);
-    if (!pkey) throw std::runtime_error("Could not read private key from " + privateKeyPath);
+std::string EnableBankingClient::signRs256(const std::string& message, const std::string& privateKeyPem) {
+    if (privateKeyPem.empty()) {
+        throw std::runtime_error("No signing key configured");
+    }
+    BIO* keyBio = BIO_new_mem_buf(privateKeyPem.data(), static_cast<int>(privateKeyPem.size()));
+    if (!keyBio) throw std::runtime_error("BIO_new_mem_buf failed");
+    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(keyBio, nullptr, nullptr, nullptr);
+    BIO_free(keyBio);
+    if (!pkey) throw std::runtime_error("Could not parse the Enable Banking private key (expected PEM)");
 
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     if (!ctx) { EVP_PKEY_free(pkey); throw std::runtime_error("EVP_MD_CTX_new failed"); }
@@ -244,7 +249,7 @@ std::string EnableBankingClient::jsonEscapeStatic(const std::string& value) {
 }
 
 std::string EnableBankingClient::generateJwt() const {
-    if (config_.privateKeyPath.empty() || config_.appCode.empty()) {
+    if (config_.privateKeyPem.empty() || config_.appCode.empty()) {
         throw std::runtime_error("ENABLEBANKING_ACCESS_TOKEN or ENABLEBANKING_PRIVATE_KEY_PATH and ENABLEBANKING_APP_CODE are required");
     }
 
@@ -253,7 +258,7 @@ std::string EnableBankingClient::generateJwt() const {
     const std::string header = std::string("{\"alg\":\"RS256\",\"typ\":\"JWT\",\"kid\":\"") + jsonEscape(config_.appCode) + "\"}";
     const std::string payload = makeJson(config_, now, exp);
     const std::string signingInput = base64UrlEncode(header) + "." + base64UrlEncode(payload);
-    const std::string signature = signWithOpenSsl(signingInput, config_.privateKeyPath);
+    const std::string signature = signRs256(signingInput, config_.privateKeyPem);
     return signingInput + "." + base64UrlEncode(signature);
 }
 
@@ -473,10 +478,11 @@ HttpResponse EnableBankingClient::request(const std::string& method, const std::
     args.emplace_back("curl");
     args.emplace_back("-sS");
     // Bound the request so a hung upstream can't block sync indefinitely.
+    const int maxTime = config_.httpTimeoutSeconds > 0 ? config_.httpTimeoutSeconds : 30;
     args.emplace_back("--connect-timeout");
-    args.emplace_back("10");
+    args.emplace_back(std::to_string(std::min(10, maxTime)));
     args.emplace_back("--max-time");
-    args.emplace_back("30");
+    args.emplace_back(std::to_string(maxTime));
     args.emplace_back("-X");
     args.emplace_back(method);
     args.emplace_back("-w");
@@ -501,9 +507,13 @@ HttpResponse EnableBankingClient::request(const std::string& method, const std::
     argv.push_back(nullptr);
 
     if (config_.debugMode) {
-        std::cout << "[DEBUG] Executing curl: ";
-        for (const auto& arg : args) {
-            std::cout << arg << " ";
+        // The argv contains the bearer token and, for POST, the request body. Debug
+        // output is tee'd to banksconnect.log, so both are redacted here.
+        std::cout << "[DEBUG] Executing curl:";
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            const bool isSecret = args[i].rfind("Authorization: Bearer ", 0) == 0 ||
+                                  (i > 0 && args[i - 1] == "--data-binary");
+            std::cout << " " << (isSecret ? "<redacted>" : args[i]);
         }
         std::cout << std::endl;
     }

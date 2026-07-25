@@ -8,18 +8,27 @@
 #include <chrono>
 #include <cctype>
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
+#include <system_error>
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <set>
 #include <sstream>
 #include <stdexcept>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
+
+#include <openssl/crypto.h>
+#include <openssl/sha.h>
 
 namespace {
 std::string trim(const std::string& value) {
@@ -29,6 +38,40 @@ std::string trim(const std::string& value) {
     }
     const std::size_t end = value.find_last_not_of(" \t\r\n");
     return value.substr(begin, end - begin + 1);
+}
+
+std::string toLowerCopy(std::string value) {
+    for (char& ch : value) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return value;
+}
+
+/// Keyword → category for bank sync. First match wins; keep patterns specific.
+std::string inferCategory(const std::string& name, const std::string& description, const std::string& type) {
+    if (type == "income") return "income";
+    if (type == "transfer") return "transfer";
+    const std::string hay = toLowerCopy(name + " " + description);
+    struct Rule { const char* needle; const char* category; };
+    static const Rule rules[] = {
+        {"biedronka", "food"}, {"lidl", "food"}, {"zabka", "food"}, {"żabka", "food"},
+        {"auchan", "food"}, {"carrefour", "food"}, {"netto", "food"},
+        {"uber", "transport"}, {"bolt", "transport"}, {"orlen", "transport"}, {"bp ", "transport"},
+        {"shell", "transport"}, {"pkp", "transport"}, {"flixbus", "transport"},
+        {"netflix", "entertainment"}, {"spotify", "entertainment"}, {"hbo", "entertainment"},
+        {"cinema", "entertainment"}, {"multikino", "entertainment"},
+        {"enea", "utilities"}, {"pge", "utilities"}, {"tauron", "utilities"}, {"orange", "utilities"},
+        {"play ", "utilities"}, {"t-mobile", "utilities"}, {"upc", "utilities"}, {"vectra", "utilities"},
+        {"apteka", "health"}, {"medicover", "health"}, {"luxmed", "health"}, {"szpital", "health"},
+        {"allegro", "shopping"}, {"amazon", "shopping"}, {"zalando", "shopping"}, {"ikea", "shopping"},
+        {"hebe", "shopping"}, {"rossmann", "shopping"},
+        {"piwo", "alko"}, {"alkohol", "alko"}, {"liquor", "alko"},
+        {"booking", "wyjazdy"}, {"airbnb", "wyjazdy"}, {"ryanair", "wyjazdy"}, {"hotel", "wyjazdy"},
+        {"oszczęd", "savings"}, {"lokata", "savings"},
+        {nullptr, nullptr}
+    };
+    for (int i = 0; rules[i].needle; ++i) {
+        if (hay.find(rules[i].needle) != std::string::npos) return rules[i].category;
+    }
+    return "other";
 }
 
 std::string lowerCopy(std::string value) {
@@ -44,14 +87,26 @@ AppServer::AppServer(EnableBankingConfig config)
 
 AppServer::~AppServer() {
     running_ = false;
+    syncWake_.notify_all();
     if (syncThread_.joinable()) {
         syncThread_.join();
     }
 }
 
 void AppServer::run() {
+    int port = 8080;
     const char* portEnv = std::getenv("PORT");
-    const int port = portEnv != nullptr && *portEnv != '\0' ? std::stoi(portEnv) : 8080;
+    if (portEnv != nullptr && *portEnv != '\0') {
+        // std::stoi would throw std::invalid_argument for a non-numeric PORT and
+        // silently accept out-of-range values such as "99999".
+        errno = 0;
+        char* parseEnd = nullptr;
+        const long parsed = std::strtol(portEnv, &parseEnd, 10);
+        if (parseEnd == portEnv || *parseEnd != '\0' || errno != 0 || parsed < 1 || parsed > 65535) {
+            throw std::runtime_error(std::string("PORT must be an integer in 1..65535, got: ") + portEnv);
+        }
+        port = static_cast<int>(parsed);
+    }
     if (!config_.mockMode) {
         if (config_.redirectUri.empty()) {
             throw std::runtime_error("ENABLEBANKING_REDIRECT_URI or PUBLIC_BASE_URL is required");
@@ -59,7 +114,7 @@ void AppServer::run() {
         if (config_.apiToken.empty()) {
             std::cout << "Warning: ENABLEBANKING_API_TOKEN is not set; /api/* endpoints will be disabled." << std::endl;
         }
-        if (config_.accessToken.empty() && (config_.privateKeyPath.empty() || config_.appCode.empty())) {
+        if (config_.accessToken.empty() && (config_.privateKeyPem.empty() || config_.appCode.empty())) {
             throw std::runtime_error("Set ENABLEBANKING_ACCESS_TOKEN or ENABLEBANKING_PRIVATE_KEY_PATH and ENABLEBANKING_APP_CODE");
         }
     }
@@ -72,6 +127,22 @@ void AppServer::run() {
 
     // Initialize SQLite database
     if (!config_.dataDir.empty()) {
+        // Falling back to an in-memory database here would silently discard every
+        // transaction the user edits, so an unusable data directory is fatal.
+        std::error_code dirError;
+        std::filesystem::create_directories(config_.dataDir, dirError);
+        if (dirError) {
+            throw std::runtime_error("ENABLEBANKING_DATA_DIR is not usable (" + config_.dataDir +
+                                     "): " + dirError.message());
+        }
+        const std::string probePath = config_.dataDir + "/.write-probe";
+        std::ofstream probe(probePath);
+        if (!probe) {
+            throw std::runtime_error("ENABLEBANKING_DATA_DIR is not writable: " + config_.dataDir);
+        }
+        probe.close();
+        std::filesystem::remove(probePath, dirError);
+
         const std::string dbPath = config_.dataDir + "/banksconnect.db";
         db_ = std::make_unique<db::Database>(dbPath);
         std::cout << "Database: " << dbPath << std::endl;
@@ -108,22 +179,50 @@ void AppServer::run() {
 }
 
 void AppServer::startSyncLoop() {
-    if (config_.syncIntervalSeconds <= 0) {
-        return;
-    }
+    // The thread starts even when polling is disabled, because manual and webhook
+    // triggered syncs are dispatched onto it too.
     syncThread_ = std::thread([this]() {
+        std::string reason = config_.syncIntervalSeconds > 0 ? "startup" : "";
         while (running_) {
-            try {
-                syncOnce("poll");
-            } catch (const std::exception& error) {
-                std::lock_guard<std::mutex> lock(stateMutex_);
-                lastError_ = error.what();
+            if (!reason.empty()) {
+                syncInProgress_ = true;
+                try {
+                    syncOnce(reason);
+                } catch (const std::exception& error) {
+                    std::lock_guard<std::mutex> lock(stateMutex_);
+                    lastError_ = error.what();
+                }
+                syncInProgress_ = false;
             }
-            for (int i = 0; i < config_.syncIntervalSeconds && running_; ++i) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+
+            std::unique_lock<std::mutex> lock(syncWakeMutex_);
+            const auto wakeup = [this]() { return syncRequested_ || !running_; };
+            if (config_.syncIntervalSeconds > 0) {
+                syncWake_.wait_for(lock, std::chrono::seconds(config_.syncIntervalSeconds), wakeup);
+            } else {
+                syncWake_.wait(lock, wakeup);
+            }
+            if (!running_) {
+                break;
+            }
+            if (syncRequested_) {
+                reason = syncRequestReason_.empty() ? "manual" : syncRequestReason_;
+                syncRequested_ = false;
+                syncRequestReason_.clear();
+            } else {
+                reason = "poll";
             }
         }
     });
+}
+
+void AppServer::requestSync(const std::string& reason) {
+    {
+        std::lock_guard<std::mutex> lock(syncWakeMutex_);
+        syncRequested_ = true;
+        syncRequestReason_ = reason;
+    }
+    syncWake_.notify_all();
 }
 
 void AppServer::syncOnce(const std::string& reason) {
@@ -149,11 +248,26 @@ void AppServer::syncOnce(const std::string& reason) {
     std::vector<db::Transaction> dbTransactions;
     std::ostringstream summary;
     summary << "reason=" << reason;
+    std::vector<std::string> upstreamFailures;
 
     auto lastFour = [](const std::string& iban) -> std::string {
         if (iban.size() <= 4) return iban;
         return iban.substr(iban.size() - 4);
     };
+
+    // An error body parses to a balance of zero and an empty transaction list, so
+    // every upstream status is checked before its payload is allowed to replace
+    // stored data.
+    auto succeeded = [](long statusCode) { return statusCode >= 200 && statusCode < 300; };
+
+    // Balances already on record, used to keep the last known good figure when the
+    // balance call fails.
+    std::map<std::string, int64_t> storedBalances;
+    if (db_) {
+        for (const auto& stored : db_->accounts()) {
+            storedBalances[stored.id] = stored.balance;
+        }
+    }
 
     if (!refs.empty()) {
         // Proper per-account Enable Banking endpoints. Each account is fully
@@ -170,8 +284,20 @@ void AppServer::syncOnce(const std::string& reason) {
                     << " bal_status=" << balResp.statusCode
                     << " tx_status=" << txResp.statusCode;
 
-            const BankAccountDetails details = parseAccountDetails(detailsResp.body);
-            const BankBalance balance = parseBalance(balResp.body);
+            const bool detailsOk = succeeded(detailsResp.statusCode);
+            const bool balanceOk = succeeded(balResp.statusCode);
+            const bool txOk = succeeded(txResp.statusCode);
+            if (!detailsOk || !balanceOk || !txOk) {
+                std::ostringstream failure;
+                failure << "account " << accountId << ":";
+                if (!detailsOk) failure << " details=" << detailsResp.statusCode;
+                if (!balanceOk) failure << " balances=" << balResp.statusCode;
+                if (!txOk) failure << " transactions=" << txResp.statusCode;
+                upstreamFailures.push_back(failure.str());
+            }
+
+            const BankAccountDetails details = detailsOk ? parseAccountDetails(detailsResp.body) : BankAccountDetails{};
+            const BankBalance balance = balanceOk ? parseBalance(balResp.body) : BankBalance{};
 
             std::string currency = !details.currency.empty() ? details.currency : balance.currency;
             if (currency.empty()) {
@@ -192,6 +318,13 @@ void AppServer::syncOnce(const std::string& reason) {
 
             const std::string dbAccountId = "bank_acc_" + accountId;
 
+            // Keep the last known balance rather than zeroing the account out.
+            int64_t effectiveBalance = balance.minorUnits;
+            if (!balanceOk) {
+                const auto stored = storedBalances.find(dbAccountId);
+                effectiveBalance = stored != storedBalances.end() ? stored->second : 0;
+            }
+
             db::Account dba;
             dba.id = dbAccountId;
             dba.name = friendlyName;
@@ -199,13 +332,17 @@ void AppServer::syncOnce(const std::string& reason) {
             dba.currency = currency;
             dba.bankName = ref.bankName;
             dba.iban = details.iban;
-            dba.balance = balance.minorUnits;
+            dba.balance = effectiveBalance;
+            dba.source = "bank";
             dbAccounts.push_back(dba);
 
             // Keep an in-memory representation for /status.
-            accounts.emplace_back(friendlyName, balance.minorUnits);
+            accounts.emplace_back(friendlyName, effectiveBalance);
 
-            const std::vector<trans> acctTx = parseTransactions(txResp.body);
+            // A failed transactions call yields no rows; treating that as "the bank
+            // returned nothing" is fine because inserts are additive, but parsing an
+            // error body could otherwise create junk rows.
+            const std::vector<trans> acctTx = txOk ? parseTransactions(txResp.body) : std::vector<trans>{};
             int accountTxCount = 0;
             for (const trans& t : acctTx) {
                 accounts.back().addTransaction(t);
@@ -220,7 +357,7 @@ void AppServer::syncOnce(const std::string& reason) {
                 dbt.fromParty = t.from;
                 dbt.toParty = t.to;
                 dbt.type = enumToString(t.type);
-                dbt.category = "other";
+                dbt.category = inferCategory(t.name, t.opis, dbt.type);
                 dbt.date = t.date;
                 dbt.source = "bank";
                 // De-duplicate on the real bank id; fall back to a per-account
@@ -242,9 +379,23 @@ void AppServer::syncOnce(const std::string& reason) {
         const ::HttpResponse balancesResponse = client_.getBalances();
         const ::HttpResponse transactionsResponse = client_.getTransactions();
 
+        if (!succeeded(accountsResponse.statusCode)) {
+            // Without a usable accounts response there is nothing to reconcile
+            // against, and continuing would overwrite good data with parsed noise.
+            throw std::runtime_error("upstream /accounts returned status " +
+                                     std::to_string(accountsResponse.statusCode));
+        }
+        if (!succeeded(balancesResponse.statusCode) || !succeeded(transactionsResponse.statusCode)) {
+            upstreamFailures.push_back("generic endpoints: balances=" +
+                                       std::to_string(balancesResponse.statusCode) + " transactions=" +
+                                       std::to_string(transactionsResponse.statusCode));
+        }
+
         accounts = parseAccounts(accountsResponse.body);
-        transactions = parseTransactions(transactionsResponse.body);
-        BankBalance genericBalance = parseBalance(balancesResponse.body);
+        transactions = succeeded(transactionsResponse.statusCode) ? parseTransactions(transactionsResponse.body)
+                                                                 : std::vector<trans>{};
+        BankBalance genericBalance = succeeded(balancesResponse.statusCode) ? parseBalance(balancesResponse.body)
+                                                                           : BankBalance{};
 
         const std::string fallbackAccountId = accounts.empty() ? "unknown" : accounts.front().getName();
         const std::string dbAccountId = "bank_acc_" + fallbackAccountId;
@@ -273,6 +424,7 @@ void AppServer::syncOnce(const std::string& reason) {
                 dba.balance = genericBalance.minorUnits;
                 a.setBalance(genericBalance.minorUnits);
             }
+            dba.source = "bank";
             dbAccounts.push_back(dba);
         }
         int idx = 0;
@@ -289,7 +441,7 @@ void AppServer::syncOnce(const std::string& reason) {
             dbt.fromParty = t.from;
             dbt.toParty = t.to;
             dbt.type = enumToString(t.type);
-            dbt.category = "other";
+            dbt.category = inferCategory(t.name, t.opis, dbt.type);
             dbt.date = t.date;
             dbt.source = "bank";
             dbt.bankTxId = !t.bankTxId.empty()
@@ -312,13 +464,46 @@ void AppServer::syncOnce(const std::string& reason) {
             db_->upsertAccount(dba);
         }
         int newTxCount = 0;
+        int updatedTxCount = 0;
+        // Ids already stored are fetched once per account. Re-synced rows are
+        // updated (with edit history) instead of skipped, so bank corrections land.
+        std::map<std::string, std::set<std::string>> seenByAccount;
         for (auto& dbt : dbTransactions) {
-            if (db_->txExists(dbt.bankTxId)) {
+            auto known = seenByAccount.find(dbt.accountId);
+            if (known == seenByAccount.end()) {
+                const std::vector<std::string> stored = db_->existingBankTxIds(dbt.accountId);
+                known = seenByAccount.emplace(dbt.accountId,
+                                              std::set<std::string>(stored.begin(), stored.end())).first;
+            }
+            if (!known->second.insert(dbt.bankTxId).second) {
+                db::Transaction existing = db_->transactionByBankId(dbt.accountId, dbt.bankTxId);
+                if (existing.id.empty()) continue; // duplicate inside this batch
+                // Preserve user-edited fields (especially category/tag).
+                db::Transaction merged = existing;
+                merged.name = dbt.name;
+                merged.description = dbt.description;
+                merged.amount = dbt.amount;
+                merged.currency = dbt.currency;
+                merged.fromParty = dbt.fromParty;
+                merged.toParty = dbt.toParty;
+                merged.type = dbt.type;
+                merged.date = dbt.date;
+                if (!db_->fieldWasUserEdited(existing.id, "category")) {
+                    merged.category = dbt.category;
+                }
+                if (!db_->fieldWasUserEdited(existing.id, "tag")) {
+                    merged.tag = existing.tag.empty() ? dbt.tag : existing.tag;
+                }
+                db_->updateTx(existing.id, merged);
+                ++updatedTxCount;
                 continue;
             }
             dbt.id = db_->uuid();
             db_->insertTx(dbt);
             ++newTxCount;
+        }
+        if (updatedTxCount > 0) {
+            summary << " updated_tx=" << updatedTxCount;
         }
         db::SyncRec rec;
         rec.syncedAt = db::Database::now();
@@ -333,7 +518,20 @@ void AppServer::syncOnce(const std::string& reason) {
     transactions_ = std::move(transactions);
     lastSyncSummary_ = summary.str();
     lastSyncTime_ = db::Database::now();
-    lastError_.clear();
+    // A partial sync must not look like a clean one, or the app will keep showing
+    // stale figures with no indication that a bank call failed.
+    if (upstreamFailures.empty()) {
+        lastError_.clear();
+    } else {
+        std::ostringstream error;
+        error << "some bank data could not be refreshed (";
+        for (std::size_t i = 0; i < upstreamFailures.size(); ++i) {
+            if (i > 0) error << "; ";
+            error << upstreamFailures[i];
+        }
+        error << ")";
+        lastError_ = error.str();
+    }
 
     if (config_.debugMode) {
         std::cout << "[DEBUG] Sync completed: " << lastSyncSummary_ << std::endl;
@@ -366,14 +564,42 @@ void AppServer::saveSessions() const {
     }
     out << "]}";
 
-    std::ofstream file(filePath);
-    if (file.is_open()) {
-        file << out.str();
-        file.close();
-        std::cout << "[EB] Sessions saved to " << filePath << std::endl;
-    } else {
-        std::cerr << "[EB] Failed to save sessions to " << filePath << std::endl;
+    // This file holds bank session IDs, which are bearer-equivalent credentials.
+    // Write to a private temp file and rename, so a crash mid-write cannot leave a
+    // truncated file behind and the contents are never briefly world-readable.
+    const std::string tempPath = filePath + ".tmp";
+    const int fd = ::open(tempPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+    if (fd < 0) {
+        std::cerr << "[EB] Failed to save sessions to " << filePath << ": " << std::strerror(errno) << std::endl;
+        return;
     }
+    const std::string payload = out.str();
+    std::size_t written = 0;
+    bool writeOk = true;
+    while (written < payload.size()) {
+        const ssize_t n = ::write(fd, payload.data() + written, payload.size() - written);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            writeOk = false;
+            break;
+        }
+        written += static_cast<std::size_t>(n);
+    }
+    if (writeOk) {
+        writeOk = ::fsync(fd) == 0;
+    }
+    ::close(fd);
+    if (!writeOk) {
+        std::cerr << "[EB] Failed to write sessions file" << std::endl;
+        ::unlink(tempPath.c_str());
+        return;
+    }
+    if (::rename(tempPath.c_str(), filePath.c_str()) != 0) {
+        std::cerr << "[EB] Failed to replace sessions file: " << std::strerror(errno) << std::endl;
+        ::unlink(tempPath.c_str());
+        return;
+    }
+    std::cout << "[EB] Sessions saved to " << filePath << std::endl;
 }
 
 void AppServer::loadSessions() {
@@ -459,11 +685,71 @@ void AppServer::loadSessions() {
     std::cout << "[EB] Loaded " << bankSessions_.size() << " saved sessions" << std::endl;
 }
 
+void AppServer::requestShutdown() {
+    // Callable from a signal handler, so this only uses async-signal-safe
+    // operations: an atomic store and shutdown(2). The sync thread is woken by the
+    // destructor's notify_all, since notifying a condition_variable from a handler
+    // is not safe.
+    running_ = false;
+    if (listenFd_ >= 0) {
+        ::shutdown(listenFd_, SHUT_RDWR);
+    }
+}
+
+bool AppServer::rateLimitExceeded(const std::string& bucket) {
+    if (config_.rateLimitPerMinute <= 0) {
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(rateMutex_);
+
+    // Opportunistically drop stale buckets so the map cannot grow without bound
+    // when many distinct source addresses connect.
+    for (auto it = rateWindows_.begin(); it != rateWindows_.end();) {
+        if (now - it->second.windowStart > std::chrono::minutes(2)) {
+            it = rateWindows_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    RateWindow& window = rateWindows_[bucket];
+    if (window.count == 0 || now - window.windowStart > std::chrono::minutes(1)) {
+        window.windowStart = now;
+        window.count = 1;
+        return false;
+    }
+    ++window.count;
+    return window.count > config_.rateLimitPerMinute;
+}
+
+namespace {
+// Writes the whole buffer, tolerating short sends and EINTR.
+bool sendAll(int fd, const std::string& data) {
+    std::size_t sent = 0;
+    while (sent < data.size()) {
+        const ssize_t written = ::send(fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (written == 0) {
+            return false;
+        }
+        sent += static_cast<std::size_t>(written);
+    }
+    return true;
+}
+}  // namespace
+
 void AppServer::serve(int port) {
     const int serverFd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (serverFd < 0) {
         throw std::runtime_error(std::string("socket failed: ") + std::strerror(errno));
     }
+    listenFd_ = serverFd;
 
     int reuse = 1;
     ::setsockopt(serverFd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -475,15 +761,19 @@ void AppServer::serve(int port) {
 
     if (::bind(serverFd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
         ::close(serverFd);
+        listenFd_ = -1;
         throw std::runtime_error(std::string("bind failed: ") + std::strerror(errno));
     }
     if (::listen(serverFd, 16) < 0) {
         ::close(serverFd);
+        listenFd_ = -1;
         throw std::runtime_error(std::string("listen failed: ") + std::strerror(errno));
     }
 
     while (running_) {
-        const int clientFd = ::accept(serverFd, nullptr, nullptr);
+        sockaddr_in peer{};
+        socklen_t peerLen = sizeof(peer);
+        const int clientFd = ::accept(serverFd, reinterpret_cast<sockaddr*>(&peer), &peerLen);
         if (clientFd < 0) {
             if (errno == EINTR) {
                 continue;
@@ -498,20 +788,33 @@ void AppServer::serve(int port) {
         ::setsockopt(clientFd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
         ::setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
+        char peerText[INET_ADDRSTRLEN] = {0};
+        ::inet_ntop(AF_INET, &peer.sin_addr, peerText, sizeof(peerText));
+
         const std::string rawRequest = readRequest(clientFd);
-        const HttpRequest request = parseRequest(rawRequest);
+        HttpRequest request = parseRequest(rawRequest);
+        request.clientIp = peerText;
+
         HttpResponse response;
-        if (config_.enforceHttps && !requestIsSecure(request) && !config_.allowInsecureHttp) {
+        if (request.unsupportedTransferEncoding) {
+            // The parser only understands Content-Length framing; accepting a
+            // chunked body would mean handling a truncated payload as complete.
+            response = {411, "text/plain; charset=utf-8",
+                        "chunked transfer encoding is not supported; send Content-Length", {}};
+        } else if (config_.enforceHttps && !requestIsSecure(request) && !config_.allowInsecureHttp) {
             response = redirectToHttps(request);
         } else {
             response = handleRequest(request);
         }
+
         const std::string rawResponse = buildResponse(response);
-        ::send(clientFd, rawResponse.data(), rawResponse.size(), 0);
+        sendAll(clientFd, rawResponse);
         ::close(clientFd);
     }
 
+    listenFd_ = -1;
     ::close(serverFd);
+    std::cout << "HTTP listener stopped" << std::endl;
 }
 
 std::string AppServer::readRequest(int clientFd) {
@@ -597,9 +900,17 @@ AppServer::HttpRequest AppServer::parseRequest(const std::string& rawRequest) {
         if (colonPos == std::string::npos) {
             continue;
         }
-        const std::string key = trim(headerLine.substr(0, colonPos));
+        // HTTP header names are case-insensitive and HTTP/2 clients send them
+        // lowercased, so normalise the key and look everything up in lower case.
+        const std::string key = lowerCopy(trim(headerLine.substr(0, colonPos)));
         const std::string value = trim(headerLine.substr(colonPos + 1));
         request.headers[key] = value;
+    }
+
+    const auto transferEncoding = request.headers.find("transfer-encoding");
+    if (transferEncoding != request.headers.end() &&
+        lowerCopy(transferEncoding->second).find("chunked") != std::string::npos) {
+        request.unsupportedTransferEncoding = true;
     }
 
     if (bodyPos != std::string::npos) {
@@ -663,14 +974,14 @@ std::string AppServer::htmlEscape(const std::string& value) {
 }
 
 bool AppServer::constantTimeEquals(const std::string& left, const std::string& right) {
-    if (left.size() != right.size()) {
-        return false;
-    }
-    unsigned char diff = 0;
-    for (std::size_t i = 0; i < left.size(); ++i) {
-        diff |= static_cast<unsigned char>(left[i] ^ right[i]);
-    }
-    return diff == 0;
+    // Compare fixed-length SHA-256 digests rather than the raw secrets, so neither
+    // the length nor the position of the first differing byte is observable in the
+    // response time.
+    unsigned char leftDigest[SHA256_DIGEST_LENGTH];
+    unsigned char rightDigest[SHA256_DIGEST_LENGTH];
+    ::SHA256(reinterpret_cast<const unsigned char*>(left.data()), left.size(), leftDigest);
+    ::SHA256(reinterpret_cast<const unsigned char*>(right.data()), right.size(), rightDigest);
+    return CRYPTO_memcmp(leftDigest, rightDigest, SHA256_DIGEST_LENGTH) == 0;
 }
 
 std::string AppServer::jsonEscape(const std::string& value) {
@@ -685,7 +996,19 @@ std::string AppServer::jsonEscape(const std::string& value) {
             case '\n': escaped += "\\n"; break;
             case '\r': escaped += "\\r"; break;
             case '\t': escaped += "\\t"; break;
-            default: escaped.push_back(ch); break;
+            default:
+                // Any other C0 control character is illegal in a JSON string and
+                // would produce a payload the client cannot parse. Bank-supplied
+                // descriptions do occasionally contain them.
+                if (static_cast<unsigned char>(ch) < 0x20) {
+                    char unicodeEscape[7];
+                    std::snprintf(unicodeEscape, sizeof(unicodeEscape), "\\u%04x",
+                                  static_cast<unsigned int>(static_cast<unsigned char>(ch)));
+                    escaped += unicodeEscape;
+                } else {
+                    escaped.push_back(ch);
+                }
+                break;
         }
     }
     return escaped;
@@ -726,21 +1049,26 @@ bool AppServer::requestIsSecure(const HttpRequest& request) const {
     if (config_.allowInsecureHttp) {
         return true;
     }
-    const auto it = request.headers.find("X-Forwarded-Proto");
+    // Forwarding headers are attacker-controlled unless a trusted proxy rewrites
+    // them, so without that guarantee treat every connection as plaintext.
+    if (!config_.trustProxyHeaders) {
+        return false;
+    }
+    const auto it = request.headers.find("x-forwarded-proto");
     if (it != request.headers.end()) {
         const std::string proto = lowerCopy(it->second);
         if (proto.find("https") != std::string::npos) {
             return true;
         }
     }
-    const auto forwarded = request.headers.find("Forwarded");
+    const auto forwarded = request.headers.find("forwarded");
     if (forwarded != request.headers.end()) {
         const std::string forwardedValue = lowerCopy(forwarded->second);
         if (forwardedValue.find("proto=https") != std::string::npos) {
             return true;
         }
     }
-    const auto ssl = request.headers.find("X-Forwarded-Ssl");
+    const auto ssl = request.headers.find("x-forwarded-ssl");
     if (ssl != request.headers.end() && lowerCopy(ssl->second) == "on") {
         return true;
     }
@@ -761,20 +1089,16 @@ std::string AppServer::configuredPublicBaseUrl() const {
 }
 
 std::string AppServer::buildHttpsUrl(const HttpRequest& request) const {
+    // The redirect target is derived from configuration, never from the request.
+    // Host / X-Forwarded-Host are attacker-controlled, and reflecting them here
+    // would turn the HTTP->HTTPS upgrade into an open redirect on the very path
+    // that carries OAuth codes.
     std::string host;
-    const auto forwardedHost = request.headers.find("X-Forwarded-Host");
-    if (forwardedHost != request.headers.end() && !forwardedHost->second.empty()) {
-        host = forwardedHost->second;
-    } else {
-        const auto hostHeader = request.headers.find("Host");
-        if (hostHeader != request.headers.end() && !hostHeader->second.empty()) {
-            host = hostHeader->second;
-        }
-    }
-    if (host.empty()) {
-        const std::string base = configuredPublicBaseUrl();
-        if (!base.empty()) {
-            host = base.substr(base.find("://") + 3);
+    const std::string base = configuredPublicBaseUrl();
+    if (!base.empty()) {
+        const std::size_t schemePos = base.find("://");
+        if (schemePos != std::string::npos) {
+            host = base.substr(schemePos + 3);
         }
     }
     if (host.empty()) {
@@ -802,7 +1126,7 @@ bool AppServer::apiAuthorized(const HttpRequest& request) const {
     if (config_.apiToken.empty()) {
         return false;
     }
-    const auto auth = request.headers.find("Authorization");
+    const auto auth = request.headers.find("authorization");
     if (auth == request.headers.end()) {
         return false;
     }
@@ -842,7 +1166,21 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     if (request.method == "GET" && request.path == "/health") {
         return {200, "text/plain; charset=utf-8", "ok", {}};
     }
+
+    // Throttle only *failed* attempts against token-protected routes, so a client
+    // holding a valid token is never rate limited but brute-forcing is bounded.
+    const bool protectedRoute = request.path.rfind("/api/", 0) == 0 || request.path == "/sync" ||
+                                request.path == "/status" || request.path == "/start-auth" ||
+                                request.path == "/auth/url";
+    if (protectedRoute && !apiAuthorized(request) && rateLimitExceeded("auth:" + request.clientIp)) {
+        return {429, "text/plain; charset=utf-8", "too many requests", {}};
+    }
     if (request.method == "GET" && request.path == "/auth/url") {
+        // Bank linking spends upstream quota and mutates persisted session state,
+        // so it must not be reachable without the API token.
+        if (!apiAuthorized(request)) {
+            return unauthorized(config_.apiToken.empty() ? "API token not configured" : "Unauthorized");
+        }
         try {
             const std::string aspsp = query.count("aspsp") ? query.at("aspsp") : config_.aspspName;
             const std::string country = query.count("country") ? query.at("country") : config_.aspspCountry;
@@ -856,12 +1194,17 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             }
             return {200, "text/plain; charset=utf-8", authResult.url, {}};
         } catch (const std::exception& error) {
+            // Upstream bodies can carry internal detail; log it, return a generic message.
+            std::cerr << "[error] /auth/url: " << error.what() << std::endl;
             std::lock_guard<std::mutex> lock(stateMutex_);
             lastError_ = error.what();
-            return {500, "text/plain; charset=utf-8", error.what(), {}};
+            return {502, "text/plain; charset=utf-8", "Could not start bank authorization", {}};
         }
     }
     if (request.method == "GET" && request.path == "/start-auth") {
+        if (!apiAuthorized(request)) {
+            return unauthorized(config_.apiToken.empty() ? "API token not configured" : "Unauthorized");
+        }
         try {
             const std::string aspsp = query.count("aspsp") ? query.at("aspsp") : config_.aspspName;
             const std::string country = query.count("country") ? query.at("country") : config_.aspspCountry;
@@ -875,17 +1218,26 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             }
             return {302, "text/plain; charset=utf-8", "redirecting", {{"Location", authResult.url}}};
         } catch (const std::exception& error) {
+            std::cerr << "[error] /start-auth: " << error.what() << std::endl;
             std::lock_guard<std::mutex> lock(stateMutex_);
             lastError_ = error.what();
-            return {500, "text/plain; charset=utf-8", error.what(), {}};
+            return {502, "text/plain; charset=utf-8", "Could not start bank authorization", {}};
         }
     }
     if (request.method == "GET" && request.path == "/oauth/callback") {
+        // Unauthenticated and it validates a secret, so cap the attempt rate.
+        if (rateLimitExceeded("callback:" + request.clientIp)) {
+            return {429, "text/plain; charset=utf-8", "too many requests", {}};
+        }
         if (query.count("error") != 0) {
             const std::string errDesc = query.count("error_description") != 0 ? query.at("error_description") : "";
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            lastError_ = query.at("error") + (errDesc.empty() ? "" : ": " + errDesc);
-            return {400, "text/plain; charset=utf-8", "OAuth error: " + lastError_, {}};
+            {
+                std::lock_guard<std::mutex> lock(stateMutex_);
+                lastError_ = query.at("error") + (errDesc.empty() ? "" : ": " + errDesc);
+            }
+            // The provider's error text is not echoed back: it is attacker-controllable
+            // for anyone who can craft a callback URL.
+            return {400, "text/plain; charset=utf-8", "Bank authorization was not completed.", {}};
         }
         const std::string code = query.count("code") != 0 ? query.at("code") : std::string();
         const std::string state = query.count("state") != 0 ? query.at("state") : std::string();
@@ -930,13 +1282,9 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                 }
                 // Persist sessions to disk
                 saveSessions();
-                // Immediately sync data now that we have a session
-                try {
-                    syncOnce("auth-callback");
-                } catch (const std::exception& syncErr) {
-                    std::lock_guard<std::mutex> lock(stateMutex_);
-                    lastError_ = std::string("sync after auth: ") + syncErr.what();
-                }
+                // Kick off the first sync in the background so the PSU's browser
+                // is not held open for the duration of the account fetch.
+                requestSync("auth-callback");
                 return {200, "text/html; charset=utf-8",
                         "<html><body><h2>Authorization successful!</h2>"
                         "<p>Bank: " + htmlEscape(connectedBank) + "</p>"
@@ -944,46 +1292,45 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                         "<p><a href=\"/\">Go to dashboard</a></p>"
                         "</body></html>", {}};
             } catch (const std::exception& error) {
+                std::cerr << "[error] POST /sessions: " << error.what() << std::endl;
                 std::lock_guard<std::mutex> lock(stateMutex_);
                 lastError_ = std::string("POST /sessions failed: ") + error.what();
-                return {500, "text/plain; charset=utf-8", "Session creation failed: " + std::string(error.what()), {}};
+                return {502, "text/plain; charset=utf-8",
+                        "Could not complete bank authorization. Please try linking the bank again.", {}};
             }
         }
         return {200, "text/plain; charset=utf-8", "Authorization received (no code). You can close this tab.", {}};
     }
     if (request.method == "POST" && request.path == "/webhook") {
+        if (rateLimitExceeded("webhook:" + request.clientIp)) {
+            return {429, "text/plain; charset=utf-8", "too many requests", {}};
+        }
         if (!webhookSecretValid(request)) {
             return {401, "text/plain; charset=utf-8", "invalid webhook secret", {}};
         }
-        if (!request.headers.count("Content-Type") || lowerCopy(request.headers.at("Content-Type")).find("application/json") == std::string::npos) {
+        if (!request.headers.count("content-type") || lowerCopy(request.headers.at("content-type")).find("application/json") == std::string::npos) {
             return {415, "text/plain; charset=utf-8", "webhook requires application/json", {}};
         }
         {
             std::lock_guard<std::mutex> lock(stateMutex_);
             lastWebhookPayload_ = request.body;
         }
-        try {
-            syncOnce("webhook");
-        } catch (const std::exception& error) {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            lastError_ = error.what();
-        }
-        return {200, "text/plain; charset=utf-8", "ok", {}};
+        // The provider expects a prompt acknowledgement, so the sync runs on the
+        // background thread rather than inside this request.
+        requestSync("webhook");
+        return {202, "application/json; charset=utf-8", "{\"status\":\"queued\"}", {}};
     }
     if (request.method == "GET" && request.path == "/sync") {
         if (!apiAuthorized(request)) {
             return unauthorized(config_.apiToken.empty() ? "API token not configured" : "Unauthorized");
         }
-        try {
-            syncOnce("manual");
-            return jsonResponse(200, renderStatus());
-        } catch (const std::exception& error) {
-            std::lock_guard<std::mutex> lock(stateMutex_);
-            lastError_ = error.what();
-            return jsonResponse(500, std::string("{\"error\":") + jsonString(error.what()) + "}");
-        }
+        requestSync("manual");
+        return jsonResponse(202, "{\"status\":\"queued\"}");
     }
     if (request.method == "GET" && request.path == "/status") {
+        if (!apiAuthorized(request)) {
+            return unauthorized(config_.apiToken.empty() ? "API token not configured" : "Unauthorized");
+        }
         return {200, "text/plain; charset=utf-8", renderStatus(), {}};
     }
     if (request.method == "GET" && request.path == "/") {
@@ -1067,6 +1414,11 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     auto ji = [&](const std::string& key) -> int64_t {
         std::string v = jf(key); return v.empty() ? 0 : std::strtoll(v.c_str(), nullptr, 10);
     };
+    // True when the key appears in the body, even if the value is "" or 0 — needed
+    // so an edit can clear a description or set an amount to zero.
+    auto hasKey = [&](const std::string& key) -> bool {
+        return request.body.find("\"" + key + "\"") != std::string::npos;
+    };
 
     // --- DB Accounts ---
     if (request.path == "/api/db/accounts") {
@@ -1080,7 +1432,8 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                 o << "{\"id\":" << jsonString(a.id) << ",\"name\":" << jsonString(a.name)
                   << ",\"type\":" << jsonString(a.type) << ",\"currency\":" << jsonString(a.currency)
                   << ",\"bank_name\":" << jsonString(a.bankName) << ",\"iban\":" << jsonString(a.iban)
-                  << ",\"color\":" << jsonString(a.color) << ",\"balance\":" << a.balance 
+                  << ",\"color\":" << jsonString(a.color) << ",\"balance\":" << a.balance
+                  << ",\"source\":" << jsonString(a.source.empty() ? "manual" : a.source)
                   << ",\"created_at\":" << jsonString(a.createdAt)
                   << ",\"updated_at\":" << jsonString(a.updatedAt) << "}";
             }
@@ -1092,7 +1445,7 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             if (a.type.empty()) a.type = "wallet";
             a.currency = jf("currency"); if (a.currency.empty()) a.currency = "PLN";
             a.balance = ji("balance"); a.bankName = jf("bank_name"); a.iban = jf("iban");
-            a.color = jf("color");
+            a.color = jf("color"); a.source = "manual";
             db_->upsertAccount(a);
             return jsonResponse(201, "{\"id\":" + jsonString(a.id) + "}");
         }
@@ -1102,9 +1455,11 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
         if (!aid.empty()) {
             if (!apiAuthorized(request)) return unauthorized("Unauthorized");
             if (request.method == "PUT") {
+                db::Account existing = db_->account(aid);
                 db::Account a; a.id = aid; a.name = jf("name"); a.type = jf("type");
                 a.currency = jf("currency"); a.balance = ji("balance");
                 a.bankName = jf("bank_name"); a.iban = jf("iban"); a.color = jf("color");
+                a.source = existing.source.empty() ? "manual" : existing.source;
                 db_->upsertAccount(a);
                 return jsonResponse(200, "{\"ok\":true}");
             }
@@ -1119,20 +1474,44 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     if (request.path == "/api/db/transactions") {
         if (!apiAuthorized(request)) return unauthorized("Unauthorized");
         if (request.method == "GET") {
-            std::string acct = query.count("account_id") ? query.at("account_id") : "";
-            std::string from = query.count("from") ? query.at("from") : "";
-            std::string to = query.count("to") ? query.at("to") : "";
-            auto txs = db_->transactions(acct, from, to);
-            auto accs = db_->accounts();
-            std::map<std::string, std::string> bankNames;
-            for (const auto& a : accs) bankNames[a.id] = a.bankName;
+            const std::string acct = query.count("account_id") ? query.at("account_id") : "";
+            const std::string from = query.count("from") ? query.at("from") : "";
+            const std::string to = query.count("to") ? query.at("to") : "";
+            const std::string category = query.count("category") ? query.at("category") : "";
+            const std::string search = query.count("q") ? query.at("q") : "";
+            const int limit = query.count("limit") ? std::atoi(query.at("limit").c_str()) : 100;
+            const int offset = query.count("offset") ? std::atoi(query.at("offset").c_str()) : 0;
 
-            std::ostringstream o; o << "[";
-            for (size_t i = 0; i < txs.size(); ++i) {
+            const db::TransactionPage page =
+                    db_->transactionPage(acct, from, to, category, search, limit, offset);
+
+            std::map<std::string, std::string> bankNames;
+            for (const auto& a : db_->accounts()) bankNames[a.id] = a.bankName;
+
+            // Splits and edit counts are fetched in one query each rather than two
+            // queries per row, which previously made this endpoint issue 2N+2
+            // statements for N transactions.
+            std::vector<std::string> ids;
+            ids.reserve(page.items.size());
+            for (const auto& t : page.items) ids.push_back(t.id);
+
+            std::map<std::string, std::vector<db::Transaction>> splitsByParent;
+            for (auto& sub : db_->subTxForParents(ids)) {
+                splitsByParent[sub.parentId].push_back(sub);
+            }
+            std::map<std::string, int64_t> editCountById;
+            for (const auto& entry : db_->editCounts(ids)) {
+                editCountById[entry.first] = entry.second;
+            }
+
+            std::ostringstream o;
+            o << "{\"total\":" << page.total << ",\"limit\":" << limit << ",\"offset\":" << offset
+              << ",\"items\":[";
+            for (size_t i = 0; i < page.items.size(); ++i) {
                 if (i) o << ",";
-                auto& t = txs[i];
-                auto subs = db_->subTx(t.id);
-                auto edits = db_->txHistory(t.id);
+                const auto& t = page.items[i];
+                const auto splitIt = splitsByParent.find(t.id);
+                const int64_t editCount = editCountById.count(t.id) ? editCountById[t.id] : 0;
                 o << "{\"id\":" << jsonString(t.id) << ",\"account_id\":" << jsonString(t.accountId)
                   << ",\"bank_name\":" << jsonString(bankNames[t.accountId])
                   << ",\"name\":" << jsonString(t.name) << ",\"description\":" << jsonString(t.description)
@@ -1141,17 +1520,20 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                   << ",\"type\":" << jsonString(t.type) << ",\"category\":" << jsonString(t.category)
                   << ",\"tag\":" << jsonString(t.tag) << ",\"date\":" << jsonString(t.date)
                   << ",\"source\":" << jsonString(t.source)
-                  << ",\"edited\":" << (edits.empty() ? "false" : "true")
-                  << ",\"edit_count\":" << edits.size()
+                  << ",\"edited\":" << (editCount > 0 ? "true" : "false")
+                  << ",\"edit_count\":" << editCount
                   << ",\"splits\":[";
-                for (size_t j = 0; j < subs.size(); ++j) {
-                    if (j) o << ",";
-                    o << "{\"id\":" << jsonString(subs[j].id) << ",\"name\":" << jsonString(subs[j].name)
-                      << ",\"amount\":" << subs[j].amount << ",\"category\":" << jsonString(subs[j].category) << "}";
+                if (splitIt != splitsByParent.end()) {
+                    const auto& subs = splitIt->second;
+                    for (size_t j = 0; j < subs.size(); ++j) {
+                        if (j) o << ",";
+                        o << "{\"id\":" << jsonString(subs[j].id) << ",\"name\":" << jsonString(subs[j].name)
+                          << ",\"amount\":" << subs[j].amount << ",\"category\":" << jsonString(subs[j].category) << "}";
+                    }
                 }
                 o << "]}";
             }
-            o << "]";
+            o << "]}";
             return jsonResponse(200, o.str());
         }
         if (request.method == "POST") {
@@ -1185,54 +1567,68 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                 return jsonResponse(200, o.str());
             }
             if (suffix == "split" && request.method == "POST") {
-                // Parse parts array from body — simplified: expects {"parts":[{"name":"A","amount":100,"category":"food"}, ...]}
                 db::Transaction parent = db_->transaction(tid);
-                std::vector<db::Transaction> parts;
-                std::string body = request.body;
-                size_t pos = 0;
-                while (true) {
-                    pos = body.find("{", pos + 1);
-                    if (pos == std::string::npos || pos < 10) break; // skip outer {
-                    size_t end = body.find("}", pos);
-                    if (end == std::string::npos) break;
-                    std::string obj = body.substr(pos, end - pos + 1);
-                    // mini parse
-                    auto of = [&](const std::string& k) -> std::string {
-                        auto p2 = obj.find("\"" + k + "\"");
-                        if (p2 == std::string::npos) return "";
-                        auto c = obj.find(':', p2); if (c == std::string::npos) return "";
-                        auto vs = obj.find_first_not_of(" \t\"", c + 1);
-                        auto ve = obj.find_first_of(",}\"", vs);
-                        return obj.substr(vs, ve - vs);
-                    };
-                    db::Transaction p; p.accountId = parent.accountId;
-                    p.name = of("name"); p.category = of("category");
-                    std::string amt = of("amount"); p.amount = amt.empty() ? 0 : std::strtoll(amt.c_str(), nullptr, 10);
-                    p.currency = parent.currency; p.date = parent.date; p.type = parent.type;
-                    p.source = parent.source; p.tag = parent.tag;
-                    parts.push_back(p);
-                    pos = end;
+                if (parent.id.empty()) {
+                    return jsonResponse(404, "{\"error\":\"transaction not found\"}");
                 }
-                db_->splitTx(tid, parts);
+                std::vector<db::Transaction> parts;
+                const std::string arrayBody = jsonFindArrayBody(request.body, "parts");
+                for (const std::string& obj : jsonSplitObjects(arrayBody)) {
+                    db::Transaction p;
+                    p.accountId = parent.accountId;
+                    p.name = jsonExtractString(obj, "name");
+                    p.category = jsonExtractString(obj, "category");
+                    if (p.category.empty()) p.category = parent.category;
+                    p.amount = jsonExtractInt64(obj, "amount");
+                    p.currency = parent.currency;
+                    p.date = parent.date;
+                    p.type = parent.type;
+                    // Parts are user-created rows, so they must be deletable and
+                    // must not inherit the parent's "bank" source.
+                    p.source = "manual";
+                    p.tag = parent.tag;
+                    parts.push_back(p);
+                }
+                try {
+                    db_->splitTx(tid, parts);
+                } catch (const std::invalid_argument& error) {
+                    return jsonResponse(422, "{\"error\":" + jsonString(error.what()) + "}");
+                }
                 return jsonResponse(200, "{\"ok\":true,\"parts\":" + std::to_string(parts.size()) + "}");
             }
             if (request.method == "PUT") {
                 db::Transaction t = db_->transaction(tid);
-                if (!jf("name").empty()) t.name = jf("name");
-                if (!jf("description").empty()) t.description = jf("description");
-                if (!jf("category").empty()) t.category = jf("category");
-                if (!jf("tag").empty()) t.tag = jf("tag");
-                if (!jf("from").empty()) t.fromParty = jf("from");
-                if (!jf("to").empty()) t.toParty = jf("to");
-                if (!jf("type").empty()) t.type = jf("type");
-                if (!jf("date").empty()) t.date = jf("date");
-                if (!jf("amount").empty()) t.amount = ji("amount");
+                if (t.id.empty()) {
+                    return jsonResponse(404, "{\"error\":\"transaction not found\"}");
+                }
+                // Every field the client sends is applied, including empty strings
+                // (so a cleared description is recorded in the edit history).
+                if (hasKey("name")) t.name = jf("name");
+                if (hasKey("description")) t.description = jf("description");
+                if (hasKey("category")) t.category = jf("category");
+                if (hasKey("tag")) t.tag = jf("tag");
+                if (hasKey("from")) t.fromParty = jf("from");
+                if (hasKey("to")) t.toParty = jf("to");
+                if (hasKey("type")) t.type = jf("type");
+                if (hasKey("date")) t.date = jf("date");
+                if (hasKey("amount")) t.amount = ji("amount");
+                if (hasKey("currency")) {
+                    const std::string currency = jf("currency");
+                    if (!currency.empty()) t.currency = currency;
+                }
                 db_->updateTx(tid, t);
                 return jsonResponse(200, "{\"ok\":true}");
             }
             if (request.method == "DELETE") {
-                db_->deleteTx(tid);
-                return jsonResponse(200, "{\"ok\":true}");
+                switch (db_->deleteTx(tid)) {
+                    case db::DeleteResult::Deleted:
+                        return jsonResponse(200, "{\"ok\":true}");
+                    case db::DeleteResult::NotFound:
+                        return jsonResponse(404, "{\"error\":\"transaction not found\"}");
+                    case db::DeleteResult::NotDeletable:
+                        return jsonResponse(409,
+                                "{\"error\":\"bank transactions cannot be deleted; they would return on the next sync\"}");
+                }
             }
         }
     }
@@ -1267,14 +1663,26 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             for (size_t i = 0; i < bs.size(); ++i) {
                 if (i) o << ",";
                 o << "{\"category\":" << jsonString(bs[i].category)
-                  << ",\"planned\":" << bs[i].planned << ",\"year_month\":" << jsonString(bs[i].yearMonth) << "}";
+                  << ",\"planned\":" << bs[i].planned
+                  << ",\"notes\":" << jsonString(bs[i].notes)
+                  << ",\"year_month\":" << jsonString(bs[i].yearMonth) << "}";
             }
             o << "]"; return jsonResponse(200, o.str());
         }
         if (request.method == "POST") {
-            db::Budget b; b.yearMonth = jf("year_month"); b.category = jf("category"); b.planned = ji("planned");
+            db::Budget b; b.yearMonth = jf("year_month"); b.category = jf("category");
+            b.planned = ji("planned"); b.notes = jf("notes");
             db_->upsertBudget(b);
             return jsonResponse(201, "{\"ok\":true}");
+        }
+    }
+    if (request.path == "/api/db/budgets/copy") {
+        if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+        if (request.method == "POST") {
+            const std::string from = jf("from");
+            const std::string to = jf("to");
+            const int n = db_->copyBudgets(from, to);
+            return jsonResponse(200, "{\"ok\":true,\"copied\":" + std::to_string(n) + "}");
         }
     }
     if (request.path == "/api/db/budgets/summary") {
@@ -1285,7 +1693,8 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
         for (size_t i = 0; i < lines.size(); ++i) {
             if (i) o << ",";
             o << "{\"category\":" << jsonString(lines[i].category)
-              << ",\"planned\":" << lines[i].planned << ",\"actual\":" << lines[i].actual << "}";
+              << ",\"planned\":" << lines[i].planned << ",\"actual\":" << lines[i].actual
+              << ",\"notes\":" << jsonString(lines[i].notes) << "}";
         }
         o << "]"; return jsonResponse(200, o.str());
     }
@@ -1375,14 +1784,17 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                 o << "{\"id\":" << id << ",\"name\":" << jsonString(goal.name)
                   << ",\"target\":" << goal.target << ",\"deadline\":" << jsonString(goal.deadline)
                   << ",\"entries\":[";
-                int64_t cumulative = 0;
+                int64_t cumulativeActual = 0;
+                int64_t cumulativePlanned = 0;
                 for (size_t j = 0; j < entries.size(); ++j) {
                     if (j) o << ",";
-                    cumulative += entries[j].actual;
+                    cumulativeActual += entries[j].actual;
+                    cumulativePlanned += entries[j].planned;
                     o << "{\"year_month\":" << jsonString(entries[j].yearMonth)
                       << ",\"planned\":" << entries[j].planned
                       << ",\"actual\":" << entries[j].actual
-                      << ",\"cumulative\":" << cumulative << "}";
+                      << ",\"cumulative\":" << cumulativeActual
+                      << ",\"cumulative_planned\":" << cumulativePlanned << "}";
                 }
                 o << "]}";
                 return jsonResponse(200, o.str());
@@ -1400,6 +1812,32 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
         }
     }
 
+    // --- Month income/expense totals (dashboard) ---
+    if (request.path == "/api/db/stats/totals") {
+        if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+        const std::string from = query.count("from") ? query.at("from") : "";
+        const std::string to = query.count("to") ? query.at("to") : "";
+        auto rows = db_->monthTotals(from, to);
+        std::ostringstream o; o << "[";
+        for (size_t i = 0; i < rows.size(); ++i) {
+            if (i) o << ",";
+            o << "{\"currency\":" << jsonString(rows[i].currency)
+              << ",\"income\":" << rows[i].income
+              << ",\"expense\":" << rows[i].expense << "}";
+        }
+        o << "]";
+        return jsonResponse(200, o.str());
+    }
+
+    // --- FX stub rates (home currency conversion helper) ---
+    if (request.path == "/api/db/fx/rates") {
+        if (!apiAuthorized(request)) return unauthorized("Unauthorized");
+        // Static indicative rates vs PLN for demo conversion — not live market data.
+        return jsonResponse(200,
+            "{\"base\":\"PLN\",\"rates\":{\"PLN\":1,\"EUR\":4.3,\"USD\":3.9,\"GBP\":5.2},"
+            "\"note\":\"Indicative stub rates for UI conversion only\"}");
+    }
+
     // --- Sync History ---
     if (request.path == "/api/db/sync/history") {
         if (!apiAuthorized(request)) return unauthorized("Unauthorized");
@@ -1415,8 +1853,8 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
     }
     if (request.path == "/api/db/sync/now" && request.method == "POST") {
         if (!apiAuthorized(request)) return unauthorized("Unauthorized");
-        try { syncOnce("api-trigger"); return jsonResponse(200, "{\"ok\":true}"); }
-        catch (const std::exception& e) { return jsonResponse(500, "{\"error\":" + jsonString(e.what()) + "}"); }
+        requestSync("api-trigger");
+        return jsonResponse(202, "{\"status\":\"queued\"}");
     }
 
     // --- Stats ---
@@ -1429,7 +1867,9 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
         for (size_t i = 0; i < rows.size(); ++i) {
             if (i) o << ",";
             o << "{\"category\":" << jsonString(rows[i].category)
-              << ",\"year_month\":" << jsonString(rows[i].yearMonth) << ",\"total\":" << rows[i].total << "}";
+              << ",\"year_month\":" << jsonString(rows[i].yearMonth)
+              << ",\"currency\":" << jsonString(rows[i].currency)
+              << ",\"total\":" << rows[i].total << "}";
         }
         o << "]"; return jsonResponse(200, o.str());
     }
@@ -1444,8 +1884,11 @@ std::string AppServer::renderStatus() const {
     out << "connected_banks=" << bankSessions_.size() << "\n";
     for (std::size_t i = 0; i < bankSessions_.size(); ++i) {
         const auto& s = bankSessions_[i];
+        // Session IDs are bearer-equivalent credentials for the bank API, so the
+        // diagnostic view reports only whether one is present.
         out << "bank[" << i << "]=" << s.aspspName << " (" << s.aspspCountry << ")"
-            << " session=" << s.sessionId << " accounts=" << s.accountIds.size() << "\n";
+            << " session=" << (s.sessionId.empty() ? "<none>" : "<set>")
+            << " accounts=" << s.accountIds.size() << "\n";
     }
     out << "total_accounts=" << accounts_.size() << "\n";
     out << "total_transactions=" << transactions_.size() << "\n";
@@ -1459,17 +1902,13 @@ std::string AppServer::renderHome() const {
     std::ostringstream out;
     out << "<html><body>";
     out << "<h1>BanksConnectApp</h1>";
-    out << "<h3>Connect a bank:</h3>";
-    out << "<ul>";
-    out << "<li><a href=\"/start-auth?aspsp=Bank%20Millennium&country=PL\">Bank Millennium</a></li>";
-    out << "<li><a href=\"/start-auth?aspsp=PKO&country=PL\">PKO BP</a></li>";
-    out << "<li><a href=\"/start-auth?aspsp=mBank&country=PL\">mBank</a></li>";
-    out << "<li><a href=\"/start-auth?aspsp=ING&country=PL\">ING</a></li>";
-    out << "<li><a href=\"/start-auth?aspsp=Santander&country=PL\">Santander</a></li>";
-    out << "</ul>";
-    out << "<h3>Status:</h3>";
-    out << "<pre>" << htmlEscape(renderStatus()) << "</pre>";
-    out << "<p><a href=\"/health\">/health</a> | <a href=\"/status\">/status</a></p>";
+    out << "<p>This is the API host for the BanksConnect mobile app.</p>";
+    // No bank-linking links and no status block: this page is reachable without a
+    // token, /start-auth now requires one, and renderStatus() reports connected
+    // banks and the last error. Linking is started from the mobile app, which
+    // calls /auth/url with its API token and opens the returned bank URL.
+    out << "<p>Link a bank from the app: Settings &rarr; Connect bank.</p>";
+    out << "<p><a href=\"/health\">/health</a></p>";
     out << "</body></html>";
     return out.str();
 }
@@ -1527,24 +1966,33 @@ std::string AppServer::renderSyncStatusJson() const {
     out << "\"last_sync_time\":" << jsonString(lastSyncTime_) << ",";
     out << "\"last_sync_summary\":" << jsonString(lastSyncSummary_) << ",";
     out << "\"last_error\":" << jsonString(lastError_) << ",";
+    out << "\"in_progress\":" << (syncInProgress_ ? "true" : "false") << ",";
     out << "\"sync_interval_seconds\":" << config_.syncIntervalSeconds;
     out << "}";
     return out.str();
 }
 
-std::string AppServer::buildResponse(const HttpResponse& response) {
+std::string AppServer::buildResponse(const HttpResponse& response) const {
     std::ostringstream out;
     out << "HTTP/1.1 " << response.status << " ";
     switch (response.status) {
         case 200: out << "OK"; break;
+        case 202: out << "Accepted"; break;
         case 301: out << "Moved Permanently"; break;
         case 302: out << "Found"; break;
         case 308: out << "Permanent Redirect"; break;
         case 400: out << "Bad Request"; break;
         case 401: out << "Unauthorized"; break;
+        case 403: out << "Forbidden"; break;
         case 404: out << "Not Found"; break;
+        case 409: out << "Conflict"; break;
+        case 411: out << "Length Required"; break;
         case 415: out << "Unsupported Media Type"; break;
+        case 422: out << "Unprocessable Entity"; break;
+        case 429: out << "Too Many Requests"; break;
         case 500: out << "Internal Server Error"; break;
+        case 502: out << "Bad Gateway"; break;
+        case 503: out << "Service Unavailable"; break;
         default: out << "OK"; break;
     }
     out << "\r\n";
@@ -1552,6 +2000,12 @@ std::string AppServer::buildResponse(const HttpResponse& response) {
     out << "Content-Length: " << response.body.size() << "\r\n";
     out << "Connection: close\r\n";
     out << "Cache-Control: no-store\r\n";
+    // Only meaningful over TLS, and only safe to advertise when HTTPS is enforced.
+    if (config_.addHsts && config_.enforceHttps && !config_.allowInsecureHttp) {
+        out << "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n";
+    }
+    out << "X-Content-Type-Options: nosniff\r\n";
+    out << "Referrer-Policy: no-referrer\r\n";
     for (const auto& header : response.headers) {
         out << header.first << ": " << header.second << "\r\n";
     }
@@ -1564,7 +2018,8 @@ bool AppServer::webhookSecretValid(const HttpRequest& request) const {
     if (config_.webhookSecret.empty()) {
         return false;
     }
-    const std::string headerName = config_.webhookSecretHeader.empty() ? "X-Webhook-Secret" : config_.webhookSecretHeader;
+    const std::string headerName = lowerCopy(
+        config_.webhookSecretHeader.empty() ? "X-Webhook-Secret" : config_.webhookSecretHeader);
     const auto it = request.headers.find(headerName);
     return it != request.headers.end() && constantTimeEquals(it->second, config_.webhookSecret);
 }

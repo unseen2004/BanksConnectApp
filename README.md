@@ -17,7 +17,7 @@ Aplikacja opiera się na modułowej architekturze, gdzie każda klasa i plik pe�
   * Webhooki i callbacki OAuth2.
   * Pętlę działającą w tle (`syncThread_`), która systematycznie synchronizuje dane z serwerami banków.
   * Wystawianie **REST API** (`/api/db/*`) dla aplikacji mobilnej z zabezpieczeniem Bearer Token.
-* **`webhook_server.h` / `webhook_server.cc`** - Dodatkowy moduł stworzony do oddzielnej obsługi żądań przychodzących (webhooków) od serwera Enable Banking (np. do powiadamiania o nowych danych do synchronizacji w czasie rzeczywistym).
+* **`money.h` / `money.cc`** - Parsowanie i formatowanie kwot w jednostkach podrzędnych (grosze) na liczbach całkowitych, bez pośredniego `double`.
 
 ### Komunikacja zewnętrzna (Enable Banking)
 * **`enablebanking_client.h` / `enablebanking_client.cc`** - Klient do połączeń z API dostawcy Enable Banking. Odpowiada za:

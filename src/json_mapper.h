@@ -30,4 +30,10 @@ BankBalance parseBalance(const std::string& json);
 /// Parse an Enable Banking account details response.
 BankAccountDetails parseAccountDetails(const std::string& json);
 
+/// Lightweight JSON helpers reused by the HTTP API (e.g. split parts array).
+std::string jsonExtractString(const std::string& object, const std::string& key);
+int64_t jsonExtractInt64(const std::string& object, const std::string& key);
+std::vector<std::string> jsonSplitObjects(const std::string& jsonArray);
+std::string jsonFindArrayBody(const std::string& json, const std::string& key);
+
 #endif //BANKSCONNECTAPP_JSON_MAPPER_H
