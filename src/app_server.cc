@@ -52,14 +52,16 @@ AppServer::~AppServer() {
 void AppServer::run() {
     const char* portEnv = std::getenv("PORT");
     const int port = portEnv != nullptr && *portEnv != '\0' ? std::stoi(portEnv) : 8080;
-    if (config_.redirectUri.empty()) {
-        throw std::runtime_error("ENABLEBANKING_REDIRECT_URI or PUBLIC_BASE_URL is required");
-    }
-    if (config_.apiToken.empty()) {
-        std::cout << "Warning: ENABLEBANKING_API_TOKEN is not set; /api/* endpoints will be disabled." << std::endl;
-    }
-    if (config_.accessToken.empty() && (config_.privateKeyPath.empty() || config_.appCode.empty())) {
-        throw std::runtime_error("Set ENABLEBANKING_ACCESS_TOKEN or ENABLEBANKING_PRIVATE_KEY_PATH and ENABLEBANKING_APP_CODE");
+    if (!config_.mockMode) {
+        if (config_.redirectUri.empty()) {
+            throw std::runtime_error("ENABLEBANKING_REDIRECT_URI or PUBLIC_BASE_URL is required");
+        }
+        if (config_.apiToken.empty()) {
+            std::cout << "Warning: ENABLEBANKING_API_TOKEN is not set; /api/* endpoints will be disabled." << std::endl;
+        }
+        if (config_.accessToken.empty() && (config_.privateKeyPath.empty() || config_.appCode.empty())) {
+            throw std::runtime_error("Set ENABLEBANKING_ACCESS_TOKEN or ENABLEBANKING_PRIVATE_KEY_PATH and ENABLEBANKING_APP_CODE");
+        }
     }
     if (config_.aspspName.empty() || config_.aspspCountry.empty()) {
         std::cout << "Warning: ENABLEBANKING_ASPSP_NAME / ENABLEBANKING_ASPSP_COUNTRY not set; /start-auth will fail." << std::endl;
@@ -76,6 +78,25 @@ void AppServer::run() {
     } else {
         db_ = std::make_unique<db::Database>(":memory:");
         std::cout << "Database: in-memory (set ENABLEBANKING_DATA_DIR for persistence)" << std::endl;
+    }
+
+    if (config_.mockMode) {
+        // Seed mock budgets for the current month
+        std::string ym = db::Database::now().substr(0, 7);
+        db::Budget b1; b1.yearMonth=ym; b1.category="food"; b1.planned=150000; db_->upsertBudget(b1);
+        db::Budget b2; b2.yearMonth=ym; b2.category="transport"; b2.planned=30000; db_->upsertBudget(b2);
+        db::Budget b3; b3.yearMonth=ym; b3.category="entertainment"; b3.planned=20000; db_->upsertBudget(b3);
+        
+        // Seed mock savings goal
+        db::SavingsGoal sg; sg.name="Nowy Samochód"; sg.target=6000000; sg.deadline="2027-01-31";
+        int64_t gid = db_->insertGoal(sg);
+        for(int m=1; m<=12; ++m) {
+            char buf[10]; snprintf(buf, sizeof(buf), "2026-%02d", m);
+            db::SavingsEntry se; se.goalId=gid; se.yearMonth=buf; 
+            se.planned = m * 500000;
+            se.actual = (m <= 7) ? (m * 480000 + (m % 2)*15000) : 0; // filled up to month 7
+            db_->upsertEntry(se);
+        }
     }
 
     // Load persisted sessions from disk
@@ -313,6 +334,10 @@ void AppServer::syncOnce(const std::string& reason) {
     lastSyncSummary_ = summary.str();
     lastSyncTime_ = db::Database::now();
     lastError_.clear();
+
+    if (config_.debugMode) {
+        std::cout << "[DEBUG] Sync completed: " << lastSyncSummary_ << std::endl;
+    }
 }
 
 void AppServer::saveSessions() const {
@@ -1055,7 +1080,8 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
                 o << "{\"id\":" << jsonString(a.id) << ",\"name\":" << jsonString(a.name)
                   << ",\"type\":" << jsonString(a.type) << ",\"currency\":" << jsonString(a.currency)
                   << ",\"bank_name\":" << jsonString(a.bankName) << ",\"iban\":" << jsonString(a.iban)
-                  << ",\"balance\":" << a.balance << ",\"created_at\":" << jsonString(a.createdAt)
+                  << ",\"color\":" << jsonString(a.color) << ",\"balance\":" << a.balance 
+                  << ",\"created_at\":" << jsonString(a.createdAt)
                   << ",\"updated_at\":" << jsonString(a.updatedAt) << "}";
             }
             o << "]";
@@ -1066,6 +1092,7 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             if (a.type.empty()) a.type = "wallet";
             a.currency = jf("currency"); if (a.currency.empty()) a.currency = "PLN";
             a.balance = ji("balance"); a.bankName = jf("bank_name"); a.iban = jf("iban");
+            a.color = jf("color");
             db_->upsertAccount(a);
             return jsonResponse(201, "{\"id\":" + jsonString(a.id) + "}");
         }
@@ -1077,7 +1104,7 @@ AppServer::HttpResponse AppServer::handleRequest(const HttpRequest& request) {
             if (request.method == "PUT") {
                 db::Account a; a.id = aid; a.name = jf("name"); a.type = jf("type");
                 a.currency = jf("currency"); a.balance = ji("balance");
-                a.bankName = jf("bank_name"); a.iban = jf("iban");
+                a.bankName = jf("bank_name"); a.iban = jf("iban"); a.color = jf("color");
                 db_->upsertAccount(a);
                 return jsonResponse(200, "{\"ok\":true}");
             }

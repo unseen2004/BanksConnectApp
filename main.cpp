@@ -165,7 +165,7 @@ void printUsage() {
     std::cout
             << "Usage:\n"
             << "  BanksConnectApp --auth-url [state] [scope]\n"
-            << "  BanksConnectApp [--debug]\n\n"
+            << "  BanksConnectApp [--debug] [--mock]\n\n"
             << "Environment:\n"
             << "  PORT\n"
             << "  ENABLEBANKING_BASE_URL\n"
@@ -310,6 +310,8 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i) {
             if (std::string(argv[i]) == "--debug") {
                 config.debugMode = true;
+            } else if (std::string(argv[i]) == "--mock") {
+                config.mockMode = true;
             } else {
                 args.push_back(argv[i]);
             }
@@ -342,14 +344,26 @@ int main(int argc, char** argv) {
         AppServer server(config);
         server.run();
 
-        if (teeOut) delete teeOut;
-        if (teeErr) delete teeErr;
+        if (teeOut) {
+            std::cout.rdbuf(oldOut);
+            delete teeOut;
+        }
+        if (teeErr) {
+            std::cerr.rdbuf(oldErr);
+            delete teeErr;
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << std::endl;
         printUsage();
-        if (teeOut) delete teeOut;
-        if (teeErr) delete teeErr;
+        if (teeOut) {
+            std::cout.rdbuf(oldOut);
+            delete teeOut;
+        }
+        if (teeErr) {
+            std::cerr.rdbuf(oldErr);
+            delete teeErr;
+        }
         return 1;
     }
 }

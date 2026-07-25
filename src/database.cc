@@ -63,7 +63,7 @@ std::string Database::uuid()const{
 void Database::init(){
     exec(R"(CREATE TABLE IF NOT EXISTS accounts(
         id TEXT PRIMARY KEY,name TEXT NOT NULL,type TEXT NOT NULL DEFAULT 'bank',
-        currency TEXT DEFAULT 'PLN',bank_name TEXT,iban TEXT,
+        currency TEXT DEFAULT 'PLN',bank_name TEXT,iban TEXT,color TEXT,
         balance INTEGER DEFAULT 0,created_at TEXT,updated_at TEXT))");
     exec(R"(CREATE TABLE IF NOT EXISTS transactions(
         id TEXT PRIMARY KEY,account_id TEXT NOT NULL,name TEXT,description TEXT,
@@ -94,11 +94,27 @@ void Database::init(){
         id INTEGER PRIMARY KEY AUTOINCREMENT,synced_at TEXT NOT NULL,
         bank_name TEXT,new_tx_count INTEGER DEFAULT 0,details TEXT))");
     // seed default categories
-    const char* cats[]={"food","transport","entertainment","utilities","health",
-        "shopping","alko","wyjazdy","savings","income","transfer","other",nullptr};
-    for(int i=0;cats[i];++i){
-        Stmt s(db_, "INSERT OR IGNORE INTO categories(name)VALUES(?)");
-        s.bindText(1, cats[i]);
+    struct CatDef { const char* name; const char* icon; const char* color; };
+    const CatDef cats[] = {
+        {"food", "mdi-food", "#FF6B6B"},
+        {"transport", "mdi-car", "#4ECDC4"},
+        {"entertainment", "mdi-movie", "#45B7D1"},
+        {"utilities", "mdi-flash", "#FDCB6E"},
+        {"health", "mdi-hospital", "#6C5CE7"},
+        {"shopping", "mdi-cart", "#FF9FF3"},
+        {"alko", "mdi-glass-wine", "#D63031"},
+        {"wyjazdy", "mdi-airplane", "#00CEC9"},
+        {"savings", "mdi-piggy-bank", "#00B894"},
+        {"income", "mdi-cash-plus", "#27AE60"},
+        {"transfer", "mdi-swap-horizontal", "#95A5A6"},
+        {"other", "mdi-dots-horizontal", "#BDC3C7"},
+        {nullptr, nullptr, nullptr}
+    };
+    for(int i=0; cats[i].name; ++i){
+        Stmt s(db_, "INSERT OR IGNORE INTO categories(name,icon,color)VALUES(?,?,?)");
+        s.bindText(1, cats[i].name);
+        s.bindText(2, cats[i].icon);
+        s.bindText(3, cats[i].color);
         s.step();
     }
 }
@@ -107,15 +123,15 @@ void Database::init(){
 std::vector<Account> Database::accounts()const{
     std::vector<Account> out;
     sqlite3_stmt*st;
-    sqlite3_prepare_v2(db_,"SELECT id,name,type,currency,bank_name,iban,balance,created_at,updated_at FROM accounts ORDER BY name",-1,&st,nullptr);
+    sqlite3_prepare_v2(db_,"SELECT id,name,type,currency,bank_name,iban,color,balance,created_at,updated_at FROM accounts ORDER BY name",-1,&st,nullptr);
     while(sqlite3_step(st)==SQLITE_ROW){
         Account a;
         auto col=[&](int i)->std::string{auto p=sqlite3_column_text(st,i);return p?(const char*)p:"";};
         a.id=col(0);a.name=col(1);a.type=col(2);
         a.currency=sqlite3_column_text(st,3)?(const char*)sqlite3_column_text(st,3):"PLN";
-        a.bankName=col(4);a.iban=col(5);
-        a.balance=sqlite3_column_int64(st,6);
-        a.createdAt=col(7);a.updatedAt=col(8);
+        a.bankName=col(4);a.iban=col(5);a.color=col(6);
+        a.balance=sqlite3_column_int64(st,7);
+        a.createdAt=col(8);a.updatedAt=col(9);
         out.push_back(a);
     }
     sqlite3_finalize(st);return out;
@@ -123,16 +139,16 @@ std::vector<Account> Database::accounts()const{
 
 void Database::upsertAccount(const Account& a){
     static const char* sql=
-        "INSERT INTO accounts(id,name,type,currency,bank_name,iban,balance,created_at,updated_at)"
-        "VALUES(?,?,?,?,?,?,?,?,?)"
+        "INSERT INTO accounts(id,name,type,currency,bank_name,iban,color,balance,created_at,updated_at)"
+        "VALUES(?,?,?,?,?,?,?,?,?,?)"
         " ON CONFLICT(id) DO UPDATE SET name=excluded.name,type=excluded.type,"
         "currency=excluded.currency,bank_name=excluded.bank_name,iban=excluded.iban,"
-        "balance=excluded.balance,updated_at=excluded.updated_at";
+        "color=excluded.color,balance=excluded.balance,updated_at=excluded.updated_at";
     Stmt s(db_, sql);
     const std::string created=a.createdAt.empty()?now():a.createdAt;
     s.bindText(1,a.id);s.bindText(2,a.name);s.bindText(3,a.type);s.bindText(4,a.currency);
-    s.bindText(5,a.bankName);s.bindText(6,a.iban);s.bindInt64(7,a.balance);
-    s.bindText(8,created);s.bindText(9,now());
+    s.bindText(5,a.bankName);s.bindText(6,a.iban);s.bindText(7,a.color);s.bindInt64(8,a.balance);
+    s.bindText(9,created);s.bindText(10,now());
     if(s.step()!=SQLITE_DONE)throw std::runtime_error(std::string("upsertAccount: ")+sqlite3_errmsg(db_));
 }
 

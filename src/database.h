@@ -5,7 +5,7 @@
 #include <vector>
 struct sqlite3;
 namespace db {
-struct Account { std::string id,name,type,currency,bankName,iban,createdAt,updatedAt; int64_t balance=0; };
+struct Account { std::string id,name,type,currency,bankName,iban,color,createdAt,updatedAt; int64_t balance=0; };
 struct Transaction { std::string id,accountId,name,description,fromParty,toParty,type,category,tag,date,source,bankTxId,parentId,currency,createdAt,updatedAt; int64_t amount=0; };
 struct TxEdit { int64_t id=0; std::string txId,field,oldVal,newVal,editedAt; };
 struct Category { std::string name,icon,color; };

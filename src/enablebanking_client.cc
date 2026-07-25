@@ -10,6 +10,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <iostream>
+#include <sstream>
 #include <utility>
 #include <vector>
 #include <openssl/evp.h>
@@ -287,12 +288,19 @@ std::string EnableBankingClient::authorizationUrl(const std::string& state, cons
 // ===== Enable Banking proper flow =====
 
 StartAuthResult EnableBankingClient::startAuthorization(const std::string& state) const {
+    if (config_.mockMode) {
+        return {"https://mock-bank.com/auth?mock=true", "mock-auth-id"};
+    }
     return startAuthorization(state, config_.aspspName, config_.aspspCountry);
 }
 
 StartAuthResult EnableBankingClient::startAuthorization(const std::string& state,
                                                          const std::string& aspspName,
                                                          const std::string& aspspCountry) const {
+    if (config_.mockMode) {
+        return {"https://mock-bank.com/auth?mock=true", "mock-auth-id"};
+    }
+
     if (aspspName.empty() || aspspCountry.empty()) {
         throw std::runtime_error("ASPSP name and country are required for authorization");
     }
@@ -347,6 +355,14 @@ StartAuthResult EnableBankingClient::startAuthorization(const std::string& state
 }
 
 SessionResult EnableBankingClient::createSession(const std::string& code) const {
+    if (config_.mockMode) {
+        SessionResult result;
+        result.sessionId = "mock-session-id";
+        result.accountIds = {"mock-account-1", "mock-account-2"};
+        result.rawJson = "{\"session_id\":\"mock-session-id\",\"accounts\":[{\"uid\":\"mock-account-1\"},{\"uid\":\"mock-account-2\"}]}";
+        return result;
+    }
+
     const std::string body = "{\"code\":\"" + jsonEscape(code) + "\"}";
 
     // Do not log the authorization code or the response body (contains session id).
@@ -410,6 +426,39 @@ HttpResponse EnableBankingClient::post(const std::string& path, const std::strin
 }
 
 HttpResponse EnableBankingClient::request(const std::string& method, const std::string& path, const std::string& body) const {
+    if (config_.mockMode) {
+        HttpResponse response;
+        response.statusCode = 200;
+        if (path.find("/details") != std::string::npos) {
+            response.body = "{\"name\":\"Konto Mockowe\",\"currency\":\"PLN\",\"account_id\":{\"iban\":\"PL12345678901234567890123456\"}}";
+        } else if (path.find("/balances") != std::string::npos) {
+            response.body = "{\"balances\":[{\"balanceAmount\":{\"amount\":\"12345.67\",\"currency\":\"PLN\"}}]}";
+        } else if (path.find("/transactions") != std::string::npos) {
+            std::ostringstream tx;
+            tx << "{\"transactions\":[";
+            std::string titles[] = {"Kawa Starbucks", "Kino Multikino", "Biedronka zakupy", "Lidl", "Paliwo Orlen", "Spotify Premium", "Netflix", "Bilet miesieczny", "Pizza", "Empik ksiazka", "Zabka", "Piekarnia"};
+            std::string dates[] = {"24", "23", "22", "21", "20", "19", "18", "17", "16", "15", "14", "13", "12", "11", "10", "09", "08", "07", "06", "05", "04", "03", "02", "01"};
+            for(int i=0; i<60; ++i) {
+                if (i > 0) tx << ",";
+                std::string t = titles[i % 12];
+                std::string d = "2026-07-" + dates[i % 24];
+                int modAmt = (12 + (i * 13) % 250);
+                std::string amtStr = "-" + std::to_string(modAmt) + "." + (i % 2 == 0 ? "50" : "00");
+                tx << "{\"transactionAmount\":{\"amount\":\"" << amtStr << "\",\"currency\":\"PLN\"},\"creditDebitIndicator\":\"DBIT\",\"remittanceInformationUnstructured\":\"" << t << "\",\"bookingDate\":\"" << d << "\",\"entryReference\":\"mock-tx-" << i << "\"}";
+            }
+            tx << ",{\"transactionAmount\":{\"amount\":\"8500.00\",\"currency\":\"PLN\"},\"creditDebitIndicator\":\"CRDT\",\"remittanceInformationUnstructured\":\"Wypłata z firmy\",\"bookingDate\":\"2026-07-10\",\"entryReference\":\"mock-tx-inc1\"}";
+            tx << ",{\"transactionAmount\":{\"amount\":\"450.00\",\"currency\":\"PLN\"},\"creditDebitIndicator\":\"CRDT\",\"remittanceInformationUnstructured\":\"Sprzedaż na Vinted\",\"bookingDate\":\"2026-07-18\",\"entryReference\":\"mock-tx-inc2\"}";
+            tx << ",{\"transactionAmount\":{\"amount\":\"1200.00\",\"currency\":\"PLN\"},\"creditDebitIndicator\":\"CRDT\",\"remittanceInformationUnstructured\":\"Zwrot podatku\",\"bookingDate\":\"2026-07-05\",\"entryReference\":\"mock-tx-inc3\"}";
+            tx << "]}";
+            response.body = tx.str();
+        } else if (path == config_.accountsPath || path == "/accounts") {
+            response.body = "{\"accounts\":[{\"uid\":\"mock-account-1\",\"name\":\"Mock Bank\",\"balanceAmount\":{\"amount\":\"12345.67\"}}]}";
+        } else {
+            response.body = "{}";
+        }
+        return response;
+    }
+
     int pipefd[2];
     if (::pipe(pipefd) != 0) {
         throw std::runtime_error(std::string("pipe failed: ") + std::strerror(errno));

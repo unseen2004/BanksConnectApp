@@ -35,6 +35,7 @@ struct EnableBankingConfig {
     int consentValidDays = 90; // how many days the consent is valid
     std::string dataDir;       // directory for persistent data (sessions.json)
     bool debugMode = false;    // print as much info as possible and log to .log
+    bool mockMode = false;     // return mock data instead of real API calls
 };
 
 struct HttpResponse {
